@@ -1,0 +1,9 @@
+{
+    "description": "SBM (Simulated Bifurcation Machine) solver",
+    "num_iters": 500,
+    "dt": 0.1,
+    "num_trials": 5,
+    "lambda_balance": 1.0,
+    "use_compile": false,
+    "device": "cpu"
+}

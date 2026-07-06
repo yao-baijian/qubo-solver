@@ -1,0 +1,10 @@
+{
+    "description": "QIS3 (Quantum-Inspired Solver v3) solver",
+    "num_iters": 500,
+    "dt": 0.1,
+    "sb_type": "bsb",
+    "branch_depth": 2,
+    "popsize": 10,
+    "adaptive": true,
+    "device": "cpu"
+}

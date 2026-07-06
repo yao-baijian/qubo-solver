@@ -1,0 +1,12 @@
+name: qubo-solver
+channels:
+    - defaults
+    - conda-forge
+dependencies:
+    - python>=3.10
+    - numpy>=1.24
+    - scipy>=1.11
+    - pytest>=7.0
+    - pip
+    - pip:
+        - torch>=2.0

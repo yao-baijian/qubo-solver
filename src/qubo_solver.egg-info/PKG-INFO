@@ -1,0 +1,20 @@
+Metadata-Version: 2.4
+Name: qubo-solver
+Version: 0.1.0
+Summary: QUBO solvers: FEM (mean-field), SBM (Simulated Bifurcation), QIS3, DIGCIM
+Home-page: https://github.com/yao-baijian/qubo-solver
+Author: Yao Baijian
+Author-email: yao-baijian@users.noreply.github.com
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: MIT License
+Requires-Python: >=3.10
+Requires-Dist: numpy>=1.24
+Requires-Dist: scipy>=1.11
+Requires-Dist: torch>=2.0
+Dynamic: author
+Dynamic: author-email
+Dynamic: classifier
+Dynamic: home-page
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
