@@ -85,6 +85,8 @@ qubo-solver/
 
 ## Latest Updates
 
+- **Adaptive annealing (FEM)**: per-variable ``β_i`` modulated by certainty
+  — prevents trapping in local minima.  Use ``FemSolver(use_adaptive_annealing=True, adaptive_A=0.5)``.
 - **Unified SB architecture**: strategy pattern (BSB, DSB, Adiabatic, DigCIM)
   + enhancement mixins (GSB, GGSB, Quantization)
 - **FEM solver**: mean-field annealing with configurable schedule
