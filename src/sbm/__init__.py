@@ -1,21 +1,36 @@
-"""SBM (Simulated Bifurcation Machine) solver package."""
+"""SBM (Simulated Bifurcation Machine) solver package.
 
-from .sbm import bsb_torch_batch, bsb_bmincut_batch
-from .gsb import gsb_batch
+Unified architecture::
+
+    from src.sbm import BaseSolver, BSBStrategy, GSBMixin, SbmSolver
+
+    # New API — compose strategy + enhancements
+    base = BaseSolver(strategy=BSBStrategy(dt=0.1),
+                       enhancements=[GSBMixin(A=0.5)],
+                       num_iters=500, num_trials=10)
+    solutions, energies = base.solve(J_ising)
+
+    # Classic API (backward compatible)
+    solver = SbmSolver(num_iters=1000, dt=0.1)
+    solution = solver.solve(Q, num_vars)
+"""
+
+from .sbm import (
+    BaseSolver, Solver, UpdateStrategy,
+    BSBStrategy, DSBStrategy, AdiabaticStrategy, DigCIMStrategy,
+    GSBMixin, GGSBMixin, QuantizationMixin,
+)
+from ._legacy import bsb_torch_batch, bsb_bmincut_batch
+from ._legacy_gsb import gsb_batch
+
 import numpy as np
 
 
 class SbmSolver:
-    """SBM-based QUBO solver with standard solve(Q, num_vars) interface.
+    """SBM-based QUBO solver (classic API, backward compatible).
 
-    Converts QUBO to Ising model internally and uses the SBM solver.
-
-    Usage::
-
-        from qubo_solver.sbm import SbmSolver
-
-        solver = SbmSolver(num_iters=1000, dt=0.1)
-        solution = solver.solve(Q, num_vars)
+    Uses ``bsb_torch_batch`` internally.  For the new composable API
+    see :class:`BaseSolver`.
     """
 
     def __init__(self, num_iters: int = 1000, dt: float = 0.1,
@@ -29,20 +44,7 @@ class SbmSolver:
         self.use_compile = use_compile
 
     def solve(self, Q, num_vars):
-        """Solve a QUBO problem via SBM.
-
-        Parameters
-        ----------
-        Q : list of (int, int, float)
-            Sparse upper-triangular QUBO matrix.
-        num_vars : int
-            Number of binary variables.
-
-        Returns
-        -------
-        list of int
-            Binary solution vector of length num_vars (values 0 or 1).
-        """
+        """Solve a QUBO problem via SBM (classic bSB)."""
         import torch
 
         Q_mat = torch.zeros(num_vars, num_vars)
