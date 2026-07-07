@@ -21,3 +21,5 @@ dist/
 # OS
 .DS_Store
 Thumbs.db
+# Benchmark output
+benchmark_results.csv
