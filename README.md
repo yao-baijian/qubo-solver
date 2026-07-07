@@ -58,19 +58,39 @@ solution = solver.solve(Q, num_vars=2)
 git submodule add https://github.com/yao-baijian/qubo-solver.git lib/qubo-solver
 ```
 
-No ``pip install`` needed — add ``lib/qubo-solver/src`` to ``sys.path``.
+No ``pip install`` needed — add ``lib/qubo-solver/src`` to ``sys.path``, then
+import directly: ``from fem import FemSolver``.
 
 ## Project Structure
 
 ```
-src/
-├── fem/          ── self-contained FEM solver package
-├── sbm/          ── unified SB: strategies, mixins, legacy solvers
-│   ├── sbm.py        ── BaseSolver, Solver, strategies, mixins
-│   ├── _legacy.py    ── bsb_torch_batch (backward compat)
-│   └── _legacy_gsb.py─ gsb_batch (backward compat)
-└── __init__.py   ── top-level exports
+qubo-solver/
+├── src/               ── package root (add this to sys.path)
+│   ├── __init__.py    ── top-level exports
+│   ├── fem/           ── mean-field annealing solver
+│   │   ├── __init__.py, interface.py, problem.py, solver_fem.py
+│   │   └── customized_problem/
+│   ├── sbm/           ── unified SB engine
+│   │   ├── __init__.py, sbm.py      ── BaseSolver, strategies, mixins
+│   │   ├── _legacy.py, _legacy_gsb.py ── backward compat
+│   │   └── utils.py
+│   ├── digcim/        ── DIGCIM wrapper (backward compat)
+│   ├── solver_base.py, method_registry.py
+├── tests/             ── test suite
+│   ├── test_unified_solver.py
+│   └── test_benchmark_solvers.py   ── grid-search benchmark on Gset/bmincut
+├── config/            ── default solver configs (FEM, SBM, QIS3)
+└── doc/               ── solver documentation (fem.md, sbm.md, qis3.md)
 ```
+
+## Latest Updates
+
+- **Unified SB architecture**: strategy pattern (BSB, DSB, Adiabatic, DigCIM)
+  + enhancement mixins (GSB, GGSB, Quantization)
+- **FEM solver**: mean-field annealing with configurable schedule
+- **Benchmark suite**: Cartesian-product grid search over sub-option
+  combinations on Gset (maxcut) and bmincut problems
+- **Backward compatible**: legacy ``bsb_torch_batch`` and ``gsb_batch`` retained
 
 ## License
 
