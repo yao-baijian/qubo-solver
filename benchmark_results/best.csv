@@ -1,2 +1,2 @@
 problem,kind,N,method,cut,energy,runtime_s,A,k,strength,num_bits
-G1,maxcut,800,BSB,11356.0,5678.0,0.032012300100177526,0.75,20,0.05,
+G1,maxcut,800,Adiabatic,11365.0,5682.5,0.026917000068351626,0.0,,,

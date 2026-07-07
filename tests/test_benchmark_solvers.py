@@ -203,76 +203,93 @@ def _run_base(prob: Problem, method_name: str, base: BaseSolver, **kw) -> List[R
     return [r]
 
 
+def _build_enhancements(A=None, k=None, strength=None, num_bits=None):
+    """Build enhancement list from sub-option values (None = not used)."""
+    enh = []
+    if A is not None:
+        enh.append(GSBMixin(A=A))
+    if k is not None and strength is not None:
+        enh.append(GGSBMixin(k=k, strength=strength))
+    if num_bits is not None:
+        enh.append(QuantizationMixin(num_bits=num_bits))
+    return enh
+
+
 def _run_grid(method_name: str, strategy_cls, prob: Problem,
               device: str, iters: int, trials: int,
               dt: float = 0.1,
               gsb_grid: Optional[List[float]] = None,
-              ggsb_k: Optional[int] = None,
-              quant_bits: Optional[List[int]] = None) -> List[Result]:
-    """Grid search over sub-options for a given strategy."""
+              ggsb_strengths: Optional[List[float]] = None,
+              quant_bits: Optional[List[int]] = None,
+              max_combos: int = 30) -> List[Result]:
+    """Cartesian-product grid search over sub-options for a given strategy.
+
+    Sub-options are orthogonal — any combination of GSB, GGSB, and Quant
+    can coexist.  ``None`` is always included for each dimension (meaning
+    "not used"), giving the baseline as one row.
+    """
+    # Build lists with None as "not used"
+    A_values = [None] + (gsb_grid or [])
+    ggsb_values = [None] + ([{"k": 20, "s": s} for s in (ggsb_strengths or [])])
+    quant_values = [None] + (quant_bits or [])
+
+    # Cartesian product
+    combos = []
+    for A in A_values:
+        for gg in ggsb_values:
+            for bits in quant_values:
+                combos.append((A, gg, bits))
+
+    # Limit combos for quick runs
+    if len(combos) > max_combos:
+        import random
+        random.seed(0)
+        # always keep baseline (all None)
+        combos = [(None, None, None)] + random.sample(combos[1:], max_combos - 1)
+
     results: List[Result] = []
-
-    # baseline
-    base = BaseSolver(strategy=strategy_cls(dt=dt),
-                      num_iters=iters, num_trials=trials, device=device)
-    results.extend(_run_base(prob, method_name, base))
-
-    # GSB: grid over A
-    if gsb_grid:
-        for A in gsb_grid:
-            base = BaseSolver(strategy=strategy_cls(dt=dt),
-                              enhancements=[GSBMixin(A=A)],
-                              num_iters=iters, num_trials=trials, device=device)
-            results.extend(_run_base(prob, method_name, base, A=A))
-
-    # GGSB: grid over strength
-    if ggsb_k:
-        for strength in [0.01, 0.05, 0.1]:
-            base = BaseSolver(strategy=strategy_cls(dt=dt),
-                              enhancements=[GGSBMixin(k=ggsb_k, strength=strength)],
-                              num_iters=iters, num_trials=trials, device=device)
-            results.extend(_run_base(prob, method_name, base, k=ggsb_k, strength=strength))
-
-    # Quant
-    if quant_bits:
-        for bits in quant_bits:
-            base = BaseSolver(strategy=strategy_cls(dt=dt),
-                              enhancements=[QuantizationMixin(num_bits=bits)],
-                              num_iters=iters, num_trials=trials, device=device)
-            results.extend(_run_base(prob, method_name, base, num_bits=bits))
-
-    # Combined GSB + GGSB
-    if gsb_grid and ggsb_k:
-        for A in gsb_grid:
-            base = BaseSolver(strategy=strategy_cls(dt=dt),
-                              enhancements=[GSBMixin(A=A),
-                                            GGSBMixin(k=ggsb_k, strength=0.05)],
-                              num_iters=iters, num_trials=trials, device=device)
-            results.extend(_run_base(prob, method_name, base, A=A, k=ggsb_k, strength=0.05))
-
+    for A, gg, bits in combos:
+        k = gg["k"] if gg else None
+        s = gg["s"] if gg else None
+        enh = _build_enhancements(A=A, k=k, strength=s, num_bits=bits)
+        base = BaseSolver(strategy=strategy_cls(dt=dt),
+                          enhancements=enh,
+                          num_iters=iters, num_trials=trials, device=device)
+        results.extend(_run_base(prob, method_name, base,
+                                 A=A if A is not None else "",
+                                 k=k if k is not None else "",
+                                 strength=s if s is not None else "",
+                                 num_bits=bits if bits is not None else ""))
     return results
 
 
 def run_bsb(prob: Problem, device: str, iters: int, trials: int) -> List[Result]:
     return _run_grid("BSB", BSBStrategy, prob, device, iters, trials,
                      gsb_grid=[0.0, 0.25, 0.5, 0.75, 1.0],
-                     ggsb_k=20, quant_bits=[4, 8])
+                     ggsb_strengths=[0.01, 0.05, 0.1],
+                     quant_bits=[4, 8])
 
 
 def run_dsb(prob: Problem, device: str, iters: int, trials: int) -> List[Result]:
     return _run_grid("DSB", DSBStrategy, prob, device, iters, trials,
                      gsb_grid=[0.0, 0.5, 1.0],
-                     ggsb_k=20, quant_bits=[4, 8])
+                     ggsb_strengths=[0.01, 0.05, 0.1],
+                     quant_bits=[4, 8],
+                     max_combos=20)
 
 
 def run_adiabatic(prob: Problem, device: str, iters: int, trials: int) -> List[Result]:
     return _run_grid("Adiabatic", AdiabaticStrategy, prob, device, iters, trials,
-                     gsb_grid=[0.0, 0.5, 1.0], ggsb_k=20)
+                     gsb_grid=[0.0, 0.5, 1.0],
+                     ggsb_strengths=[0.01, 0.05, 0.1],
+                     max_combos=15)
 
 
 def run_digcim(prob: Problem, device: str, iters: int, trials: int) -> List[Result]:
     return _run_grid("DigCIM", DigCIMStrategy, prob, device, iters, trials,
-                     gsb_grid=[0.0, 0.5, 1.0], ggsb_k=20)
+                     gsb_grid=[0.0, 0.5, 1.0],
+                     ggsb_strengths=[0.01, 0.05, 0.1],
+                     max_combos=15)
 
 
 def run_legacy(prob: Problem, device: str, iters: int, trials: int) -> List[Result]:
