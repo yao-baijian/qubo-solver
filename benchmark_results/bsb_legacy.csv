@@ -1,0 +1,2 @@
+problem,kind,N,method,cut,energy,runtime_s,A,k,strength,num_bits
+G1,maxcut,800,BSB_legacy,10916.0,5458.0,0.03095339983701706,,,,

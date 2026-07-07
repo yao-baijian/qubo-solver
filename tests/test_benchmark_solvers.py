@@ -1,31 +1,28 @@
 """Comprehensive benchmark: all SB methods + FEM on standard Ising problems.
 
-Runs every strategy / mixin combination on Gset (maxcut), real-world
-bmincut, and erdos-renyi bmincut graphs, then writes the best result and
-configuration for each (problem, method) pair to CSV.
+For each **main method** (BSB, DSB, Adiabatic, DigCIM), runs a grid over
+sub-options (GSB strength ``A``, GGSB interval ``k``, quantisation bits)
+and writes a per-method CSV.  A final summary CSV collects the best result
+across all methods for each problem.
 
 Usage::
 
-    python -m tests.test_benchmark_solvers                     # small quick run
-    python -m tests.test_benchmark_solvers --quick              # 1 problem each
-    python -m tests.test_benchmark_solvers --full               # all + more iters
+    python -m tests.test_benchmark_solvers            # default
+    python -m tests.test_benchmark_solvers --quick     # small, fast
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-import math
-import os
 import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
-# ── path setup ────────────────────────────────────────────────────────────
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
@@ -40,7 +37,7 @@ from src.sbm import (  # noqa: E402
 from src.fem import FemSolver  # noqa: E402
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 1. Problem Loaders
+# 1. Problem loaders
 # ═══════════════════════════════════════════════════════════════════════════
 
 BENCHMARK_ROOT = Path(r"C:\project\Hybird-Ising-Partition\benchmarks")
@@ -49,413 +46,347 @@ BENCHMARK_ROOT = Path(r"C:\project\Hybird-Ising-Partition\benchmarks")
 @dataclass
 class Problem:
     name: str
-    kind: str              # "maxcut" | "bmincut"
-    J: torch.Tensor        # Ising coupling (symmetric, zero diag, N×N)
+    kind: str
+    J: torch.Tensor
     N: int
-    best_known: Optional[float] = None
 
 
-def load_gset(gset_path: Path) -> Problem:
-    """Load a Gset file (maxcut).  Format: first line ``N M``,
-    subsequent lines ``u v w`` (1-indexed)."""
-    with open(gset_path) as f:
-        first = f.readline()
-        N, _ = [int(x) for x in first.split()]
-    # Use pandas-free loader
+def load_gset(path: Path) -> Problem:
+    with open(path) as f:
+        N, _ = [int(x) for x in f.readline().split()]
     data = torch.tensor(
-        [list(map(int, line.split())) for line in open(gset_path).read().strip().split("\n")[1:]],
+        [list(map(int, l.split())) for l in open(path).read().strip().split("\n")[1:]],
         dtype=torch.long,
     )
-    u = data[:, 0] - 1  # 1 → 0 index
-    v = data[:, 1] - 1
+    u, v = data[:, 0] - 1, data[:, 1] - 1
     w = data[:, 2].float() if data.shape[1] > 2 else torch.ones(data.shape[0])
-    J = torch.zeros(N, N)
-    J[u, v] = w
-    J[v, u] = w
-    name = gset_path.name
-    return Problem(name=name, kind="maxcut", J=J, N=N)
+    J = torch.zeros(N, N); J[u, v] = w; J[v, u] = w
+    return Problem(name=path.name, kind="maxcut", J=J, N=N)
 
 
-def load_bmincut_txt(txt_path: Path) -> Problem:
-    """Load a bmincut .txt file.  Format: first line ``N M``,
-    subsequent lines ``u v [w]`` (1-indexed, weight defaults to 1)."""
-    with open(txt_path) as f:
-        first = f.readline()
-        parts = first.split()
-        N = int(parts[0])
-    raw = [line.split() for line in open(txt_path).read().strip().split("\n")[1:]]
+def load_bmincut_txt(path: Path) -> Problem:
+    with open(path) as f:
+        N = int(f.readline().split()[0])
+    raw = [l.split() for l in open(path).read().strip().split("\n")[1:]]
     u, v, w = [], [], []
     for row in raw:
-        u.append(int(row[0]) - 1)
-        v.append(int(row[1]) - 1)
+        u.append(int(row[0]) - 1); v.append(int(row[1]) - 1)
         w.append(float(row[2]) if len(row) > 2 else 1.0)
-    u = torch.tensor(u, dtype=torch.long)
-    v = torch.tensor(v, dtype=torch.long)
-    w = torch.tensor(w, dtype=torch.float)
-    J = torch.zeros(N, N)
-    J[u, v] = w
-    J[v, u] = w
-    name = txt_path.stem
-    return Problem(name=name, kind="bmincut", J=J, N=N)
+    u, v = torch.tensor(u, dtype=torch.long), torch.tensor(v, dtype=torch.long)
+    J = torch.zeros(N, N); J[u, v] = w; J[v, u] = w
+    return Problem(name=path.stem, kind="bmincut", J=J, N=N)
 
 
-def load_erdos_renyi(txt_path: Path) -> Problem:
-    """Erdos-Renyi bmincut graphs: same format as bmincut."""
-    return load_bmincut_txt(txt_path)
+def load_erdos_renyi(path: Path) -> Problem:
+    return load_bmincut_txt(path)
 
 
 def _first_int(path: Path) -> int:
-    """Read first integer from first line of a file (fast, no alloc)."""
     with open(path) as f:
         return int(f.readline().split()[0])
 
 
 def discover_problems(quick: bool = False, max_nodes: int = 5000) -> List[Problem]:
-    """Discover all benchmark problems, skipping those with N > max_nodes."""
     problems: List[Problem] = []
 
-    def _safe_load(loader_fn, path, label=""):
-        # Quick pre-check: skip huge files before allocating dense J
+    def _safe(loader, path, label=""):
         try:
-            n = _first_int(path)
-            if n > max_nodes:
-                print(f"  [skip] {label} {path.name} (N={n} > {max_nodes})")
+            if _first_int(path) > max_nodes:
+                print(f"  [skip] {label} {path.name} (too large)")
                 return None
-        except Exception:
-            pass
-        try:
-            prob = loader_fn(path)
-            return prob
+            return loader(path)
         except Exception as e:
             print(f"  [skip] {label} {path.name}: {e}")
             return None
 
-    # Gset (maxcut)
-    gset_dir = BENCHMARK_ROOT / "maxcut" / "Gset"
-    if gset_dir.is_dir():
-        gset_files = sorted(gset_dir.glob("G[0-9]*"))
+    for sub, loader, label in [
+        (BENCHMARK_ROOT / "maxcut" / "Gset", load_gset, "Gset"),
+        (BENCHMARK_ROOT / "bmincut" / "real_world_graphs", load_bmincut_txt, "bmincut"),
+        (BENCHMARK_ROOT / "bmincut" / "erdos_renyi_graphs", load_erdos_renyi, "erdos-renyi"),
+    ]:
+        if not sub.is_dir():
+            continue
+        files = sorted(sub.glob("*"))
         if quick:
-            gset_files = gset_files[:2]
-        for f in gset_files:
-            p = _safe_load(load_gset, f, "Gset")
-            if p:
-                problems.append(p)
-
-    # real-world bmincut
-    rw_dir = BENCHMARK_ROOT / "bmincut" / "real_world_graphs"
-    if rw_dir.is_dir():
-        rw_files = sorted(rw_dir.glob("*.txt"))
-        if quick:
-            rw_files = rw_files[:1]
-        for f in rw_files:
-            p = _safe_load(load_bmincut_txt, f, "bmincut")
-            if p:
-                problems.append(p)
-
-    # erdos-renyi bmincut
-    er_dir = BENCHMARK_ROOT / "bmincut" / "erdos_renyi_graphs"
-    if er_dir.is_dir():
-        er_files = sorted(er_dir.glob("*.txt"))
-        if quick:
-            er_files = er_files[:1]
-        for f in er_files:
-            p = _safe_load(load_erdos_renyi, f, "erdos-renyi")
+            files = files[:2]
+        for f in files:
+            if f.name.startswith(".") or f.suffix in (".py", ".ipynb"):
+                continue
+            p = _safe(loader, f, label)
             if p:
                 problems.append(p)
     return problems
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 2. Evaluation helpers
+# 2. Evaluation / CSV helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
 def cut_value(J: torch.Tensor, spins: torch.Tensor) -> float:
-    """Cut value for a spin configuration (±1).  For maxcut: ¼ (∑J - sᵀJs)."""
     return 0.25 * (J.sum() - (spins @ J @ spins)).item()
 
 
 def energy_ising(J: torch.Tensor, spins: torch.Tensor) -> float:
-    """Ising energy: -½ sᵀJs."""
     return -0.5 * (spins @ J @ spins).item()
 
 
 @dataclass
 class Result:
-    problem: str
-    kind: str
-    N: int
-    method: str
-    config: str
-    cut: float
-    energy: float
-    runtime_s: float
-    spins: List[int] = field(repr=False)
+    problem: str = ""
+    kind: str = ""
+    N: int = 0
+    method: str = ""
+    cut: float = 0.0
+    energy: float = 0.0
+    runtime_s: float = 0.0
+    A: str = ""
+    k: str = ""
+    strength: str = ""
+    num_bits: str = ""
+    spins: str = ""  # serialised as comma-separated ints
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 3. SB Methods
-# ═══════════════════════════════════════════════════════════════════════════
+RESULT_FIELDS = [
+    "problem", "kind", "N", "method",
+    "cut", "energy", "runtime_s",
+    "A", "k", "strength", "num_bits",
+]
 
-SB_CONFIGS: List[Tuple[str, Callable[[torch.Tensor, int], BaseSolver]]] = []
-
-
-def _register(name: str):
-    def dec(fn):
-        SB_CONFIGS.append((name, fn))
-        return fn
-    return dec
+OUT_DIR = ROOT / "benchmark_results"
 
 
-@_register("BSB")
-def _bsb(J, N, device, iters, trials):
-    return BaseSolver(strategy=BSBStrategy(dt=0.1), num_iters=iters, num_trials=trials, device=device)
-
-
-@_register("BSB+GSB(A=0.5)")
-def _bsb_gsb05(J, N, device, iters, trials):
-    return BaseSolver(strategy=BSBStrategy(dt=0.1),
-                      enhancements=[GSBMixin(A=0.5)],
-                      num_iters=iters, num_trials=trials, device=device)
-
-
-@_register("BSB+GSB(A=1.0)")
-def _bsb_gsb10(J, N, device, iters, trials):
-    return BaseSolver(strategy=BSBStrategy(dt=0.1),
-                      enhancements=[GSBMixin(A=1.0)],
-                      num_iters=iters, num_trials=trials, device=device)
-
-
-@_register("BSB+GGSB")
-def _bsb_ggsb(J, N, device, iters, trials):
-    return BaseSolver(strategy=BSBStrategy(dt=0.1),
-                      enhancements=[GGSBMixin(k=20, strength=0.05)],
-                      num_iters=iters, num_trials=trials, device=device)
-
-
-@_register("BSB+Quant4")
-def _bsb_quant4(J, N, device, iters, trials):
-    return BaseSolver(strategy=BSBStrategy(dt=0.1),
-                      enhancements=[QuantizationMixin(num_bits=4)],
-                      num_iters=iters, num_trials=trials, device=device)
-
-
-@_register("BSB+Quant8")
-def _bsb_quant8(J, N, device, iters, trials):
-    return BaseSolver(strategy=BSBStrategy(dt=0.1),
-                      enhancements=[QuantizationMixin(num_bits=8)],
-                      num_iters=iters, num_trials=trials, device=device)
-
-
-@_register("DSB")
-def _dsb(J, N, device, iters, trials):
-    return BaseSolver(strategy=DSBStrategy(dt=0.1),
-                      num_iters=iters, num_trials=trials, device=device)
-
-
-@_register("Adiabatic")
-def _adiabatic(J, N, device, iters, trials):
-    return BaseSolver(strategy=AdiabaticStrategy(dt=0.1),
-                      num_iters=iters, num_trials=trials, device=device)
-
-
-@_register("DigCIM")
-def _digcim(J, N, device, iters, trials):
-    return BaseSolver(strategy=DigCIMStrategy(dt=0.1),
-                      num_iters=iters, num_trials=trials, device=device)
-
-
-@_register("BSB+GSB(A=1.0)+GGSB")
-def _bsb_gsb_ggsb(J, N, device, iters, trials):
-    return BaseSolver(strategy=BSBStrategy(dt=0.1),
-                      enhancements=[GSBMixin(A=1.0), GGSBMixin(k=20, strength=0.05)],
-                      num_iters=iters, num_trials=trials, device=device)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 4. Main Benchmark
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-def run_sb(problem: Problem, device: str = "cpu",
-           iters: int = 500, trials: int = 10) -> List[Result]:
-    """Run all SB configurations on a single problem."""
-    J = problem.J.to(device)
-    J_ising = -J / 2.0
-    results: List[Result] = []
-    print(f"  SB benchmark on {problem.name} (N={problem.N}) — {len(SB_CONFIGS)} configs")
-    for name, builder in SB_CONFIGS:
-        try:
-            base = builder(J, problem.N, device, iters, trials)
-            t0 = time.perf_counter()
-            sols, engs = base.solve(J_ising)
-            dt = time.perf_counter() - t0
-            best_idx = int(torch.argmin(engs).item())
-            best_spins = sols[best_idx]
-            cut = cut_value(J, best_spins)
-            eng = engs[best_idx].item()
-            results.append(Result(
-                problem=problem.name, kind=problem.kind, N=problem.N,
-                method="SB", config=name,
-                cut=cut, energy=eng, runtime_s=dt,
-                spins=best_spins.tolist(),
-            ))
-            print(f"    {name:20s}  cut={cut:.2f}  energy={eng:.4f}  time={dt:.3f}s")
-        except Exception as e:
-            print(f"    {name:20s}  FAILED: {e}")
-    return results
-
-
-def run_fem(problem: Problem, device: str = "cpu",
-            num_steps: int = 200, num_trials: int = 5) -> List[Result]:
-    """Run FEM on a single problem."""
-    N = problem.N
-    J = problem.J.to(device)
-    print(f"  FEM on {problem.name} (N={N})")
-    results: List[Result] = []
-    # FEM operates on QUBO format: build Q from J_ising
-    J_ising = -J / 2.0
-    Q = []
-    for i in range(N):
-        for j in range(i, N):
-            v = float(J_ising[i, j].item())
-            if v != 0.0:
-                Q.append((i, j, v))
-    try:
-        solver = FemSolver(num_steps=num_steps, num_trials=num_trials, dev=device)
-        t0 = time.perf_counter()
-        sol_list = solver.solve(Q, N)
-        dt = time.perf_counter() - t0
-        spins = torch.tensor(sol_list, device=device, dtype=torch.float) * 2 - 1  # 0/1 → -1/+1
-        cut = cut_value(J, spins)
-        eng = energy_ising(J_ising, spins)
-        results.append(Result(
-            problem=problem.name, kind=problem.kind, N=N,
-            method="FEM", config="default",
-            cut=cut, energy=eng, runtime_s=dt,
-            spins=spins.tolist(),
-        ))
-        print(f"    FEM   cut={cut:.2f}  energy={eng:.4f}  time={dt:.3f}s")
-    except Exception as e:
-        print(f"    FEM   FAILED: {e}")
-    return results
-
-
-def run_bsb_legacy(problem: Problem, device: str = "cpu",
-                   iters: int = 500, trials: int = 10) -> List[Result]:
-    """Run legacy bsb_torch_batch for comparison."""
-    J = problem.J.to(device)
-    J_ising = -J / 2.0
-    results: List[Result] = []
-    print(f"  Legacy bSB on {problem.name} (N={problem.N})")
-    try:
-        init_x = 2 * torch.rand(trials, problem.N, device=device) - 1
-        init_y = torch.zeros(trials, problem.N, device=device)
-        t0 = time.perf_counter()
-        energies, solutions, _ = bsb_torch_batch(J_ising, init_x, init_y, iters, 0.1)
-        dt = time.perf_counter() - t0
-        best_idx = int(torch.argmin(energies[:, -1]).item())
-        best_spins = solutions[best_idx]
-        cut = cut_value(J, best_spins)
-        eng = energies[best_idx, -1].item()
-        results.append(Result(
-            problem=problem.name, kind=problem.kind, N=problem.N,
-            method="SB_legacy", config="bsb_torch_batch",
-            cut=cut, energy=eng, runtime_s=dt,
-            spins=best_spins.tolist(),
-        ))
-        print(f"    bsb_legacy  cut={cut:.2f}  energy={eng:.4f}  time={dt:.3f}s")
-    except Exception as e:
-        print(f"    bsb_legacy  FAILED: {e}")
-    return results
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 5. CSV Output
-# ═══════════════════════════════════════════════════════════════════════════
-
-def write_csv(results: List[Result], path: Path):
-    """Write results to CSV, one row per (problem, method, config)."""
-    fieldnames = ["problem", "kind", "N", "method", "config",
-                  "cut", "energy", "runtime_s"]
+def write_per_method(results: List[Result], method: str):
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    path = OUT_DIR / f"{method.lower()}.csv"
     with open(path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w = csv.DictWriter(f, fieldnames=RESULT_FIELDS)
         w.writeheader()
         for r in results:
-            w.writerow({
-                "problem": r.problem,
-                "kind": r.kind,
-                "N": r.N,
-                "method": r.method,
-                "config": r.config,
-                "cut": f"{r.cut:.6f}",
-                "energy": f"{r.energy:.6f}",
-                "runtime_s": f"{r.runtime_s:.6f}",
-            })
-    print(f"\nResults written to {path}")
+            w.writerow({k: getattr(r, k, "") for k in RESULT_FIELDS})
+    print(f"  -> {path}")
 
 
-def print_summary(results: List[Result]):
-    """Print best config per (problem, method)."""
-    by_key: Dict[Tuple[str, str], Result] = {}
-    for r in results:
-        key = (r.problem, r.method)
-        if key not in by_key or r.cut > by_key[key].cut:
-            by_key[key] = r
-    print("\n" + "=" * 70)
-    print(f"{'Problem':20s} {'Method':15s} {'Config':20s} {'Cut':>10s} {'Time':>8s}")
-    print("-" * 70)
-    for (prob, method), r in sorted(by_key.items()):
-        print(f"{prob:20s} {method:15s} {r.config:20s} {r.cut:10.2f} {r.runtime_s:8.3f}")
-    print("=" * 70)
+def write_best_summary(all_results: List[Result]):
+    best: Dict[str, Result] = {}
+    for r in all_results:
+        if r.problem not in best or r.cut > best[r.problem].cut:
+            best[r.problem] = r
+    path = OUT_DIR / "best.csv"
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=RESULT_FIELDS)
+        w.writeheader()
+        for prob in sorted(best):
+            w.writerow({k: getattr(best[prob], k, "") for k in RESULT_FIELDS})
+    print(f"  -> {path}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 6. CLI
+# 3. Method runners with grid search over sub-options
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _run_base(prob: Problem, method_name: str, base: BaseSolver, **kw) -> List[Result]:
+    J = prob.J.to(base.device)
+    J_ising = -J / 2.0
+    t0 = time.perf_counter()
+    sols, engs = base.solve(J_ising)
+    dt = time.perf_counter() - t0
+    best_idx = int(torch.argmin(engs).item())
+    spins = sols[best_idx]
+    r = Result(
+        problem=prob.name, kind=prob.kind, N=prob.N,
+        method=method_name,
+        cut=cut_value(J, spins), energy=engs[best_idx].item(), runtime_s=dt,
+        spins=",".join(str(int(s)) for s in spins.tolist()),
+    )
+    for k, v in kw.items():
+        setattr(r, k, str(v))
+    return [r]
+
+
+def _run_grid(method_name: str, strategy_cls, prob: Problem,
+              device: str, iters: int, trials: int,
+              dt: float = 0.1,
+              gsb_grid: Optional[List[float]] = None,
+              ggsb_k: Optional[int] = None,
+              quant_bits: Optional[List[int]] = None) -> List[Result]:
+    """Grid search over sub-options for a given strategy."""
+    results: List[Result] = []
+
+    # baseline
+    base = BaseSolver(strategy=strategy_cls(dt=dt),
+                      num_iters=iters, num_trials=trials, device=device)
+    results.extend(_run_base(prob, method_name, base))
+
+    # GSB: grid over A
+    if gsb_grid:
+        for A in gsb_grid:
+            base = BaseSolver(strategy=strategy_cls(dt=dt),
+                              enhancements=[GSBMixin(A=A)],
+                              num_iters=iters, num_trials=trials, device=device)
+            results.extend(_run_base(prob, method_name, base, A=A))
+
+    # GGSB: grid over strength
+    if ggsb_k:
+        for strength in [0.01, 0.05, 0.1]:
+            base = BaseSolver(strategy=strategy_cls(dt=dt),
+                              enhancements=[GGSBMixin(k=ggsb_k, strength=strength)],
+                              num_iters=iters, num_trials=trials, device=device)
+            results.extend(_run_base(prob, method_name, base, k=ggsb_k, strength=strength))
+
+    # Quant
+    if quant_bits:
+        for bits in quant_bits:
+            base = BaseSolver(strategy=strategy_cls(dt=dt),
+                              enhancements=[QuantizationMixin(num_bits=bits)],
+                              num_iters=iters, num_trials=trials, device=device)
+            results.extend(_run_base(prob, method_name, base, num_bits=bits))
+
+    # Combined GSB + GGSB
+    if gsb_grid and ggsb_k:
+        for A in gsb_grid:
+            base = BaseSolver(strategy=strategy_cls(dt=dt),
+                              enhancements=[GSBMixin(A=A),
+                                            GGSBMixin(k=ggsb_k, strength=0.05)],
+                              num_iters=iters, num_trials=trials, device=device)
+            results.extend(_run_base(prob, method_name, base, A=A, k=ggsb_k, strength=0.05))
+
+    return results
+
+
+def run_bsb(prob: Problem, device: str, iters: int, trials: int) -> List[Result]:
+    return _run_grid("BSB", BSBStrategy, prob, device, iters, trials,
+                     gsb_grid=[0.0, 0.25, 0.5, 0.75, 1.0],
+                     ggsb_k=20, quant_bits=[4, 8])
+
+
+def run_dsb(prob: Problem, device: str, iters: int, trials: int) -> List[Result]:
+    return _run_grid("DSB", DSBStrategy, prob, device, iters, trials,
+                     gsb_grid=[0.0, 0.5, 1.0],
+                     ggsb_k=20, quant_bits=[4, 8])
+
+
+def run_adiabatic(prob: Problem, device: str, iters: int, trials: int) -> List[Result]:
+    return _run_grid("Adiabatic", AdiabaticStrategy, prob, device, iters, trials,
+                     gsb_grid=[0.0, 0.5, 1.0], ggsb_k=20)
+
+
+def run_digcim(prob: Problem, device: str, iters: int, trials: int) -> List[Result]:
+    return _run_grid("DigCIM", DigCIMStrategy, prob, device, iters, trials,
+                     gsb_grid=[0.0, 0.5, 1.0], ggsb_k=20)
+
+
+def run_legacy(prob: Problem, device: str, iters: int, trials: int) -> List[Result]:
+    J = prob.J.to(device)
+    J_ising = -J / 2.0
+    init_x = 2 * torch.rand(trials, prob.N, device=device) - 1
+    init_y = torch.zeros(trials, prob.N, device=device)
+    t0 = time.perf_counter()
+    energies, solutions, _ = bsb_torch_batch(J_ising, init_x, init_y, iters, 0.1)
+    dt = time.perf_counter() - t0
+    best_idx = int(torch.argmin(energies[:, -1]).item())
+    spins = solutions[best_idx]
+    return [Result(
+        problem=prob.name, kind=prob.kind, N=prob.N,
+        method="BSB_legacy",
+        cut=cut_value(J, spins), energy=energies[best_idx, -1].item(), runtime_s=dt,
+        spins=spins.tolist(),
+    )]
+
+
+def run_fem(prob: Problem, device: str, iters: int, trials: int) -> List[Result]:
+    N = prob.N
+    J_ising = -prob.J.to(device) / 2.0
+    Q = [(i, j, float(J_ising[i, j].item()))
+         for i in range(N) for j in range(i, N) if J_ising[i, j] != 0]
+    solver = FemSolver(num_steps=iters, num_trials=trials, dev=device)
+    t0 = time.perf_counter()
+    sol_list = solver.solve(Q, N)
+    dt = time.perf_counter() - t0
+    spins = torch.tensor(sol_list, device=device, dtype=torch.float) * 2 - 1
+    return [Result(
+        problem=prob.name, kind=prob.kind, N=N, method="FEM",
+        cut=cut_value(prob.J.to(device), spins),
+        energy=energy_ising(J_ising, spins), runtime_s=dt,
+        spins=spins.tolist(),
+    )]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 4. Main
 # ═══════════════════════════════════════════════════════════════════════════
 
 def main():
     parser = argparse.ArgumentParser(description="QUBO solver benchmark suite")
-    parser.add_argument("--quick", action="store_true", help="Quick run (1 prob each)")
-    parser.add_argument("--full", action="store_true", help="Full run (more iters)")
+    parser.add_argument("--quick", action="store_true", help="Quick run")
     parser.add_argument("--device", default="cpu", help="Torch device")
-    parser.add_argument("--output", default=None, help="CSV output path")
     args = parser.parse_args()
 
-    device = args.device
-    if args.full:
-        iters, trials, fem_steps = 1000, 20, 500
-    elif args.quick:
-        iters, trials, fem_steps = 100, 4, 100
-    else:
-        iters, trials, fem_steps = 300, 8, 300
+    iters, trials = (100, 4) if args.quick else (300, 8)
 
     problems = discover_problems(quick=args.quick)
-    print(f"Discovered {len(problems)} problems")
-    for p in problems:
-        print(f"  {p.name:20s}  N={p.N:5d}  kind={p.kind}")
+    print(f"Discovered {len(problems)} problems\n")
+
+    method_runners = [
+        ("BSB", run_bsb),
+        ("DSB", run_dsb),
+        ("Adiabatic", run_adiabatic),
+        ("DigCIM", run_digcim),
+    ]
 
     all_results: List[Result] = []
+
     for prob in problems:
-        if prob.N > 5000 and device == "cpu":
-            print(f"\n  Skipping {prob.name} (N={prob.N} too large for CPU)")
-            continue
         print(f"\n{'=' * 60}")
-        print(f"  Problem: {prob.name}  (N={prob.N}, {prob.kind})")
+        print(f"  {prob.name:20s}  N={prob.N:5d}  {prob.kind}")
         print(f"{'=' * 60}")
-        all_results.extend(run_sb(prob, device, iters, trials))
-        all_results.extend(run_bsb_legacy(prob, device, iters, trials))
-        if prob.N <= 2000:  # FEM is slower on large dense
-            all_results.extend(run_fem(prob, device, fem_steps, max(3, trials // 2)))
 
-    output_path = args.output or (ROOT / "benchmark_results.csv")
-    write_csv(all_results, output_path)
-    print_summary(all_results)
+        for name, runner in method_runners:
+            if prob.N > 3000 and name == "DigCIM":
+                print(f"  {name}: skip (N={prob.N} too large)")
+                continue
+            res = runner(prob, args.device, iters, trials)
+            all_results.extend(res)
+            for r in res:
+                parts = [f"cut={r.cut:.1f}", f"time={r.runtime_s:.3f}s"]
+                if r.A: parts.append(f"A={r.A}")
+                if r.k: parts.append(f"k={r.k}")
+                if r.strength: parts.append(f"s={r.strength}")
+                if r.num_bits: parts.append(f"bits={r.num_bits}")
+                print(f"  {r.method:10s}  {' '.join(parts)}")
 
-    # Regression: ensure no errors
-    n_errors = sum(1 for r in all_results if r.cut == 0 and r.energy == 0)
-    if n_errors > 0:
-        print(f"\n  ⚠ {n_errors} results have zero cut (check for errors)")
-    print(f"\n  ✓ {len(all_results)} results total")
+        # legacy + FEM
+        all_results.extend(run_legacy(prob, args.device, iters, trials))
+        if prob.N <= 2000:
+            all_results.extend(run_fem(prob, args.device, iters // 2, max(3, trials // 2)))
+
+    # ── Write CSVs ────────────────────────────────────────────────────
+    print(f"\n{'=' * 60}")
+    print("  Writing results ...")
+
+    for name, _ in method_runners:
+        write_per_method([r for r in all_results if r.method == name], name)
+
+    for m in ("BSB_legacy", "FEM"):
+        write_per_method([r for r in all_results if r.method == m], m)
+
+    write_best_summary(all_results)
+
+    # ── Print best table ──────────────────────────────────────────────
+    best: Dict[str, Result] = {}
+    for r in all_results:
+        if r.problem not in best or r.cut > best[r.problem].cut:
+            best[r.problem] = r
+
+    print(f"\n{'=' * 70}")
+    print(f"{'Problem':20s} {'Method':12s} {'Cut':>10s} {'Time':>8s}  Sub-options")
+    print("-" * 70)
+    for prob in sorted(best):
+        r = best[prob]
+        opts = " ".join(f"{k}={v}" for k, v in
+                        [("A", r.A), ("k", r.k), ("bits", r.num_bits)] if v)
+        print(f"{r.problem:20s} {r.method:12s} {r.cut:10.1f} {r.runtime_s:8.3f}  {opts}")
+    print(f"{'=' * 70}")
+    print(f"\n  \u2713 {len(all_results)} total results")
 
 
 if __name__ == "__main__":
