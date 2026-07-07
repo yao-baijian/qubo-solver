@@ -1,2 +1,2 @@
 problem,kind,N,method,cut,energy,runtime_s,A,k,strength,num_bits
-G1,maxcut,800,FEM,0.0,9588.0,0.39537320006638765,,,,
+G1,maxcut,800,FEM,0.0,9588.0,0.4382523000240326,,,,

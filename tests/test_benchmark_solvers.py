@@ -23,10 +23,11 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
+_script_dir = Path(__file__).resolve().parent
+ROOT = _script_dir.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+sys.modules.pop("src", None)
 
 from src.sbm import (  # noqa: E402
     BaseSolver, BSBStrategy, DSBStrategy,
