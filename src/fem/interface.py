@@ -54,14 +54,14 @@ class FEM:
             anneal='inverse', optimizer='adam', learning_rate=0.1, dev='cuda', 
             dtype=torch.float32, seed=1, q=2, manual_grad=False, 
             h_factor=0.01, sparse=False, drawer = None,
-            use_compile=False
+            use_compile=False, **kwargs
         ):
         assert 'problem' in self.__dict__.keys()
         self.solver = Solver(
             self.problem, num_trials, num_steps, betamin, betamax, anneal, 
             optimizer, learning_rate, dev, dtype, seed, q, manual_grad, 
             h_factor, sparse, drawer = drawer,
-            use_compile=use_compile,
+            use_compile=use_compile, **kwargs,
         )
 
     def solve(self):

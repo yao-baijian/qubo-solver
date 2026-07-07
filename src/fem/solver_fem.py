@@ -31,6 +31,8 @@ class Solver:
         sparse: bool = False,
         drawer: Optional[Callable] = None,
         use_compile: bool = False,
+        use_adaptive_annealing: bool = False,
+        adaptive_A: float = 0.5,
     ):
         self.problem = problem
         self.num_trials = num_trials
@@ -49,6 +51,8 @@ class Solver:
         self.sparse = sparse
         self.drawer = drawer
         self.use_compile = use_compile
+        self.use_adaptive_annealing = use_adaptive_annealing
+        self.adaptive_A = adaptive_A
 
         self._setup()
 
@@ -136,6 +140,34 @@ class Solver:
 
         return p_opt, fe_record
 
+    def _adaptive_free_energy(self, p, expected, beta):
+        """Per-variable free energy with certainty-modulated β_i.
+
+        For binary (q=2): certainty = (max_prob - 0.5) / 0.5
+        For q>2:          certainty = (max_prob - 1/q) / (1 - 1/q)
+        β_eff_i = β * (1 - A * certainty_i)
+        F = E - Σ_i S_i / β_eff_i
+        """
+        N = self.N
+        batch = p.shape[0]
+
+        if self.q == 2:
+            p1 = p[..., 1]
+            max_prob = torch.max(p1, 1.0 - p1)
+            certainty = (max_prob - 0.5) / 0.5
+            S_i = -(p[..., 0] * torch.log(p[..., 0] + 1e-12)
+                    + p1 * torch.log(p1 + 1e-12))
+        else:
+            max_prob = torch.max(p, dim=2)[0]
+            certainty = (max_prob - 1.0 / self.q) / (1.0 - 1.0 / self.q)
+            S_i = -(p * torch.log(p + 1e-12)).sum(dim=2)
+
+        certainty = torch.clamp(certainty, 0.0, 1.0)
+        mod = 1.0 - self.adaptive_A * certainty
+        beta_eff = beta * mod                               # (batch, N)
+        entropy_term = (S_i / beta_eff).sum(dim=1)          # (batch,)
+        return beta * expected - entropy_term
+
     def solve(self):
         """Run the full solver and return (configs, energies).
 
@@ -154,8 +186,11 @@ class Solver:
             if self.manual_grad:
                 grad = self.problem.generate_grad(p_opt)
 
-            entropy = self._s(p_opt).sum(dim=1)
-            fe = self._free_energy(p_opt, expected, beta, entropy)
+            if self.use_adaptive_annealing:
+                fe = self._adaptive_free_energy(p_opt, expected, beta)
+            else:
+                entropy = self._s(p_opt).sum(dim=1)
+                fe = self._free_energy(p_opt, expected, beta, entropy)
             fe_record[step] = fe
 
             if self.manual_grad:

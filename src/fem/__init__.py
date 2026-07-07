@@ -21,7 +21,10 @@ class FemSolver:
                  anneal: str = 'lin', dev: str = 'cpu',
                  manual_grad: bool = False, use_compile: bool = False,
                  learning_rate: float = 0.1, betamin: float = 0.01,
-                 betamax: float = 0.5, **kwargs):
+                 betamax: float = 0.5,
+                 use_adaptive_annealing: bool = False,
+                 adaptive_A: float = 0.5,
+                 **kwargs):
         self.num_trials = num_trials
         self.num_steps = num_steps
         self.anneal = anneal
@@ -31,6 +34,8 @@ class FemSolver:
         self.learning_rate = learning_rate
         self.betamin = betamin
         self.betamax = betamax
+        self.use_adaptive_annealing = use_adaptive_annealing
+        self.adaptive_A = adaptive_A
         self.extra_kwargs = kwargs
 
     def solve(self, Q, num_vars):
@@ -73,6 +78,8 @@ class FemSolver:
             q=2, manual_grad=self.manual_grad,
             use_compile=self.use_compile,
             learning_rate=self.learning_rate,
+            use_adaptive_annealing=self.use_adaptive_annealing,
+            adaptive_A=self.adaptive_A,
             **self.extra_kwargs,
         )
         configs, results = case.solve()
