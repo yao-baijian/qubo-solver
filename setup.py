@@ -9,7 +9,8 @@ setup(
     author="Yao Baijian",
     author_email="yao-baijian@users.noreply.github.com",
     url="https://github.com/yao-baijian/qubo-solver",
-    packages=find_packages(),
+    package_dir={"": "src"},
+    packages=find_packages(where="src"),
     include_package_data=True,
     python_requires=">=3.10",
     install_requires=[
