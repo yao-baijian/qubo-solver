@@ -4,7 +4,7 @@ Wraps the ``DigCIMStrategy`` from the unified SBM solver.
 """
 import numpy as np
 import torch
-from ..sbm import BaseSolver, DigCIMStrategy
+from sbm import BaseSolver, DigCIMStrategy
 
 
 def digsim(J, num_iters=1000, dt=0.1):
