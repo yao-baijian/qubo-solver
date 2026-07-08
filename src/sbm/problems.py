@@ -260,3 +260,176 @@ def dt_grid(algorithm: str = "bsb") -> List[float]:
 def scale_grid() -> List[float]:
     """Return a recommended scale grid for quantised SB."""
     return [round(0.5 + i * 0.5, 1) for i in range(31)]  # 0.5–15.5
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 5. TSP legalizer — repair invalid solutions
+# ═══════════════════════════════════════════════════════════════════════════
+
+def tsp_extract_with_legalizer(
+    spin_config: np.ndarray,
+    N: int,
+    city_distances: Optional[np.ndarray] = None,
+) -> Tuple[List[int], bool, float]:
+    """Extract a TSP tour, repairing violations via greedy legalizer.
+
+    Returns
+    -------
+    path : list of int
+        City indices in visitation order.
+    was_valid : bool
+        Whether the raw spin was already valid.
+    cost : float
+        Tour distance (0 if distances not given).
+    """
+    spin_matrix = spin_config.reshape(N, N)
+    row_sums = np.sum(spin_matrix > 0, axis=1)
+    col_sums = np.sum(spin_matrix > 0, axis=0)
+
+    is_valid = bool(np.all(row_sums == 1) and np.all(col_sums == 1))
+
+    if is_valid:
+        path = [-1] * N
+        for j in range(N):
+            for i in range(N):
+                if spin_matrix[i, j] > 0:
+                    path[j] = i
+                    break
+        cost = _tour_distance(path, city_distances) if city_distances is not None else 0.0
+        return path, True, cost
+
+    # ── Legaliser ────────────────────────────────────────────────────
+    positive_spins = []
+    for i in range(N):
+        for j in range(N):
+            if spin_matrix[i, j] > 0:
+                positive_spins.append((i, j, spin_matrix[i, j]))
+    positive_spins.sort(key=lambda x: x[2], reverse=True)
+
+    assigned_positions = set()
+    assigned_cities = set()
+    path = [-1] * N
+
+    for city, pos, _ in positive_spins:
+        if pos not in assigned_positions and city not in assigned_cities:
+            path[pos] = city
+            assigned_positions.add(pos)
+            assigned_cities.add(city)
+
+    for city, pos, _ in positive_spins:
+        if path[pos] == -1 and city not in assigned_cities:
+            path[pos] = city
+            assigned_positions.add(pos)
+            assigned_cities.add(city)
+
+    missing_cities = set(range(N)) - assigned_cities
+    missing_positions = set(range(N)) - assigned_positions
+
+    if missing_cities or missing_positions:
+        _complete_missing(path, missing_cities, missing_positions)
+
+    if not _validate_path(path):
+        path = _greedy_construct(spin_matrix, N)
+
+    cost = _tour_distance(path, city_distances) if city_distances is not None else 0.0
+    return path, False, cost
+
+
+def _tour_distance(path: List[int], distances: np.ndarray) -> float:
+    n = len(path)
+    total = 0.0
+    for i in range(n):
+        total += distances[path[i], path[(i + 1) % n]]
+    return total
+
+
+def _complete_missing(path: List[int], missing_cities, missing_positions):
+    mc = list(missing_cities)
+    mp = list(missing_positions)
+    for pos in mp:
+        if mc:
+            path[pos] = mc.pop(0)
+
+
+def _greedy_construct(spin_matrix: np.ndarray, N: int) -> List[int]:
+    scores = spin_matrix.copy()
+    path = [-1] * N
+    used_c = set()
+    used_p = set()
+    while len(used_p) < N:
+        best_score = -np.inf
+        best_city = -1
+        best_pos = -1
+        for i in range(N):
+            if i in used_c:
+                continue
+            for j in range(N):
+                if j in used_p:
+                    continue
+                if scores[i, j] > best_score:
+                    best_score = scores[i, j]
+                    best_city = i
+                    best_pos = j
+        if best_city != -1 and best_pos != -1:
+            path[best_pos] = best_city
+            used_c.add(best_city)
+            used_p.add(best_pos)
+        else:
+            rc = set(range(N)) - used_c
+            rp = set(range(N)) - used_p
+            for pos in rp:
+                if rc:
+                    path[pos] = rc.pop()
+            break
+    return path
+
+
+def _validate_path(path: List[int]) -> bool:
+    if -1 in path:
+        return False
+    if len(set(path)) != len(path):
+        return False
+    if min(path) < 0 or max(path) >= len(path):
+        return False
+    return True
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 6. TSPLIB reader
+# ═══════════════════════════════════════════════════════════════════════════
+
+def read_tsplib(filename: str) -> Tuple[int, np.ndarray, str]:
+    """Read a TSPLIB-format file and return (dimension, coordinates, name)."""
+    coords = []
+    dim = 0
+    name = ""
+    reading = False
+    with open(filename, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith("NAME"):
+                name = line.split(":")[1].strip()
+            elif line.startswith("DIMENSION"):
+                dim = int(line.split(":")[1].strip())
+            elif line.startswith("NODE_COORD_SECTION"):
+                reading = True
+            elif line.startswith("EOF"):
+                break
+            elif reading and line:
+                parts = line.split()
+                if len(parts) >= 3:
+                    coords.append([float(parts[1]), float(parts[2])])
+    return dim, np.array(coords), name
+
+
+def tsp_coords_to_distance(coords: np.ndarray) -> np.ndarray:
+    """Compute Euclidean distance matrix from TSPLIB coordinates."""
+    n = len(coords)
+    d = np.zeros((n, n))
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                dx = coords[i, 0] - coords[j, 0]
+                dy = coords[i, 1] - coords[j, 1]
+                d[i, j] = np.sqrt(dx * dx + dy * dy)
+    return d
