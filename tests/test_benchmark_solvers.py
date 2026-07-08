@@ -254,14 +254,17 @@ def _run_grid(method_name: str, strategy_cls, prob: Problem,
                 for bits in quant_values:
                     combos.append((dt, A, gg, bits))
 
-    # Limit combos for quick runs
+    # Limit combos for quick runs — ensure at least baseline-only per dt
     if len(combos) > max_combos:
         import random
         random.seed(0)
-        # always keep at least one baseline per dt value
         baselines = [(dt, None, None, None) for dt in dt_values]
-        rest = [c for c in combos if c not in baselines]
-        combos = baselines + random.sample(rest, max_combos - len(baselines))
+        if max_combos <= len(baselines):
+            # Sample dt values themselves
+            combos = random.sample(baselines, max_combos)
+        else:
+            rest = [c for c in combos if c not in baselines]
+            combos = baselines + random.sample(rest, max_combos - len(baselines))
 
     results: List[Result] = []
     for dt, A, gg, bits in combos:
