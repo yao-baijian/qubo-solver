@@ -7,8 +7,11 @@ Supported problems
 ------------------
 - **MaxCut** — partition graph into two sets maximising cut edges.
 - **Balanced MinCut** — partition into two equal-weight sets minimising cut edges.
+- **MaxSAT** — maximum satisfiability (MAX-3SAT) on N Boolean variables.
 - **TSP** — travelling salesman problem (N² binary variables).
-- **QUBO** — general quadratic unconstrained binary optimisation.
+- **QUBO / QPLIB** — general quadratic unconstrained binary optimisation with
+  optional linear bias term (via the auxiliary-variable trick).
+- **Higher-order** — cubic + quadratic objectives (see :mod:`sbm.higher_order`).
 """
 
 from __future__ import annotations
@@ -433,3 +436,233 @@ def tsp_coords_to_distance(coords: np.ndarray) -> np.ndarray:
                 dy = coords[i, 1] - coords[j, 1]
                 d[i, j] = np.sqrt(dx * dx + dy * dy)
     return d
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 7. QUBO / QPLIB — general quadratic with linear bias
+# ═══════════════════════════════════════════════════════════════════════════
+
+def qubo_to_ising(Q: torch.Tensor) -> torch.Tensor:
+    """Convert a general QUBO matrix to an Ising coupling matrix.
+
+    For a binary vector :math:`x \\in \\{0,1\\}^N`, the QUBO objective is
+    :math:`x^\\top Q x`.  The transformation to Ising spins
+    :math:`s = 2x - 1 \\in \\{\\pm 1\\}^N` is:
+
+        J_ising = Q / 4
+        h_i = Σ_j Q_ij / 4
+        J[aux, :] = J[: , aux] = h / 2
+
+    This adds one auxiliary spin to absorb the linear (local-field) term.
+
+    Parameters
+    ----------
+    Q : Tensor (N, N)
+        QUBO matrix (upper-triangular convention is fine; it will be symmetrised).
+
+    Returns
+    -------
+    J : Tensor (N+1, N+1)
+        Ising coupling with an extra auxiliary variable.
+    """
+    N = Q.shape[0]
+    device = Q.device
+    dtype = Q.dtype
+    Q_sym = 0.5 * (Q + Q.T)
+    J_ising = 0.25 * Q_sym
+    h = 0.25 * Q_sym.sum(dim=1)
+    J = torch.zeros(N + 1, N + 1, device=device, dtype=dtype)
+    J[:N, :N] = J_ising
+    J[:N, N] = 0.5 * h
+    J[N, :N] = 0.5 * h
+    return J
+
+
+def qplib_to_ising(
+    Q: np.ndarray,
+    b: np.ndarray,
+    num_vars: int,
+    device: Optional[torch.device] = None,
+) -> Tuple[torch.Tensor, int]:
+    """Convert a QPLIB-format (Q, b) problem to an Ising coupling matrix.
+
+    The QPLIB objective is :math:`\\frac{1}{2} x^\\top Q x + b^\\top x + q^0`.
+
+    The conversion uses an extra auxiliary spin to absorb the linear term::
+
+        J_ising = Q / 8
+        h_ising = Q·1 / 4 + b / 2
+        J[extra_var, :] = J[: , extra_var] = 0.7 · h_ising
+
+    Parameters
+    ----------
+    Q : ndarray (N, N)
+        Quadratic coefficient matrix.
+    b : ndarray (N,)
+        Linear coefficient vector.
+    num_vars : int
+        Number of variables N.
+    device : torch.device or None
+        Target device.
+
+    Returns
+    -------
+    J : Tensor (N+1, N+1)
+        Ising coupling matrix (one extra variable added).
+    num_vars : int
+        New variable count (``N+1``).
+    """
+    if device is None:
+        device = torch.device("cpu")
+
+    Q_t = torch.tensor(Q, dtype=torch.float32, device=device)
+    Q_sym = 0.5 * (Q_t + Q_t.T)
+
+    b_t = torch.tensor(b, dtype=torch.float32, device=device)
+    ones = torch.ones(num_vars, dtype=torch.float32, device=device)
+
+    J_ising = 0.125 * Q_sym
+    h_ising = 0.25 * torch.matmul(Q_sym, ones) + 0.5 * b_t
+
+    J_tensor = torch.zeros((num_vars + 1, num_vars + 1), device=device)
+    J_tensor[:num_vars, :num_vars] = J_ising
+    J_tensor[:num_vars, num_vars] = 0.7 * h_ising
+    J_tensor[num_vars, :num_vars] = 0.7 * h_ising
+
+    return J_tensor, num_vars + 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 8. MaxSAT — Maximum Satisfiability
+# ═══════════════════════════════════════════════════════════════════════════
+
+def max3sat_to_ising(
+    clauses: List[Tuple[int, int, int]],
+    num_vars: int,
+    penalty: float = 4.0,
+) -> torch.Tensor:
+    """Convert a MAX-3SAT instance (list of 3-literal clauses) to Ising coupling.
+
+    Each clause is a tuple ``(a, b, c)`` where positive integers represent
+    positive literals (variable ``i`` is true) and negative integers represent
+    negated literals (variable ``|i|`` is false).  Literals are 1-indexed.
+
+    A clause is unsatisfied when all three literals are false.  We add a
+    penalty term for each clause that is ``penalty`` when the clause is
+    false and 0 otherwise.
+
+    The resulting Ising coupling is an :math:`(N+1) \\times (N+1)` matrix
+    (one auxiliary variable absorbs the constant offset).
+
+    Parameters
+    ----------
+    clauses : list of (int, int, int)
+        Each tuple contains three literals (1-indexed, negative = negated).
+    num_vars : int
+        Number of Boolean variables.
+    penalty : float
+        Energy penalty per unsatisfied clause (default 4.0).
+
+    Returns
+    -------
+    J : Tensor (N+1, N+1)
+    """
+    N = num_vars
+    device = torch.device("cpu")
+
+    # Ising variables s = 2x - 1  →  x = (s+1)/2
+    # Clause is false when all literals are false (x=0).
+    # Using the Choi (2010) reduction: for clause (l1 ∨ l2 ∨ l3),
+    # the penalty Hamiltonian (in QUBO) is:
+    #   H_pen = penalty · (1 - x(l1) - x(l2) - x(l3) + x(l1)x(l2) + x(l1)x(l3) + x(l2)x(l3))
+    # Convert to Ising: x = (s+1)/2
+
+    Q = torch.zeros(N, N, dtype=torch.float32)
+    h = torch.zeros(N, dtype=torch.float32)
+    const = 0.0
+
+    for a, b, c in clauses:
+        literals = [a, b, c]
+        signs = [1 if l > 0 else 0 for l in literals]   # 1 = positive literal
+        idxs = [abs(l) - 1 for l in literals]
+
+        # In QUBO: penalty · (1 - Σx_i + Σ_{i<j} x_i x_j)
+        # For literal l: if positive, use x; if negative, use (1-x).
+        # x(l) = x_i if sign=1 else (1 - x_i)
+        # This gives:
+        # H = penalty · (1 - Σ(l_i) + Σ(l_i · l_j))
+        # where l_i = x_i or (1-x_i)
+
+        # We'll compute the QUBO coefficients directly.
+        # Let l_i = sign_i * x_i + (1 - sign_i) * (1 - x_i)
+        #           = sign_i * x_i + (1 - sign_i) - (1 - sign_i) * x_i
+        #           = (2*sign_i - 1) * x_i + (1 - sign_i)
+        #           = sgn_i * x_i + offset_i
+        # where sgn_i = 2*sign_i - 1 ∈ {+1, -1}
+        #       offset_i = 1 - sign_i ∈ {0, 1}
+
+        sgn = [2 * s - 1 for s in signs]
+        off = [1 - s for s in signs]
+
+        # Constant part
+        c_part = penalty * (1 - sum(off))
+        for i in range(3):
+            c_part -= penalty * off[i] * sum(sgn[j] for j in range(3) if j != i)
+        const += c_part
+
+        # Linear part
+        for i in range(3):
+            coeff = -penalty * sgn[i]
+            for j in range(3):
+                if j != i:
+                    coeff -= penalty * off[j] * sgn[i]
+            h[idxs[i]] += coeff
+
+        # Quadratic part
+        for i in range(3):
+            for j in range(i + 1, 3):
+                Q[idxs[i], idxs[j]] += penalty * sgn[i] * sgn[j]
+
+    # Convert QUBO to Ising:
+    # QUBO: x^T Q x + h^T x + const
+    # x = (s+1)/2
+    # → 0.25 * s^T Q s + 0.5 * (Q·1 + h)^T s + const'
+    J_ising = 0.25 * Q
+    h_ising = 0.5 * (Q.sum(dim=1) + h)
+
+    # Build full Ising matrix with auxiliary variable
+    J = torch.zeros(N + 1, N + 1, dtype=torch.float32)
+    J[:N, :N] = J_ising
+    J[:N, N] = 0.5 * h_ising
+    J[N, :N] = 0.5 * h_ising
+
+    return J
+
+
+def maxsat_count_satisfied(
+    clauses: List[Tuple[int, int, int]],
+    spins: torch.Tensor,
+) -> int:
+    """Count satisfied clauses for a MAX-3SAT problem (given Ising spins ±1).
+
+    Parameters
+    ----------
+    clauses : list of (int, int, int)
+        Clause list (same format as :func:`max3sat_to_ising`).
+    spins : Tensor (N,)
+        Ising spin assignment (values ±1).
+
+    Returns
+    -------
+    int
+        Number of satisfied clauses.
+    """
+    satisfied = 0
+    for a, b, c in clauses:
+        for l in (a, b, c):
+            idx = abs(l) - 1
+            true = (spins[idx] > 0) if l > 0 else (spins[idx] < 0)
+            if true:
+                satisfied += 1
+                break
+    return satisfied

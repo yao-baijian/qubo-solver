@@ -28,8 +28,10 @@ from .problems import (
     maxcut_to_ising, bmincut_to_ising, tsp_to_ising, dt_grid, scale_grid,
     read_tsplib, tsp_coords_to_distance,
     tsp_extract_with_legalizer,
+    qubo_to_ising, qplib_to_ising,
+    max3sat_to_ising, maxsat_count_satisfied,
 )
-from .higher_order import CubicOptimizer, qplib_to_ising
+from .higher_order import CubicOptimizer
 
 import numpy as np
 

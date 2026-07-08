@@ -5,15 +5,18 @@ and **Ising** problems, with a unified, composable architecture.
 
 ## What problems can it solve?
 
-| Problem | Description | Solver |
-|---------|-------------|--------|
-| **MaxCut** | Partition graph vertices into two sets maximising the total weight of cut edges. | SBM (all strategies), FEM |
-| **Balanced MinCut** | Partition graph into two equal-size blocks minimising cut edges. | SBM (``BSBStrategy``, ``DSBStrategy``), FEM |
-| **TSP** | Find the shortest Hamiltonian cycle visiting every city exactly once. | SBM (all strategies) |
-| **General QUBO** | Minimise xᵀQx for binary x ∈ {0,1}ⁿ. | SBM, FEM |
+| Problem | Description | Converter | Solver |
+|---------|-------------|-----------|--------|
+| **MaxCut** | Partition graph vertices into two sets maximising the total weight of cut edges. | ``maxcut_to_ising`` | SBM (all strategies), FEM |
+| **Balanced MinCut** | Partition graph into two equal-size blocks minimising cut edges. | ``bmincut_to_ising`` | SBM (BSB, DSB), FEM |
+| **Max-3SAT** | Maximum satisfiability of 3-CNF clauses. | ``max3sat_to_ising`` | SBM (all strategies) |
+| **TSP** | Find the shortest Hamiltonian cycle visiting every city exactly once. | ``tsp_to_ising`` | SBM (all strategies) |
+| **QUBO** | Minimise xᵀQx for binary x ∈ {0,1}ⁿ. | ``qubo_to_ising`` | SBM, FEM |
+| **QPLIB** | General QUBO with linear bias: ½xᵀQx + bᵀx + q⁰. | ``qplib_to_ising`` | SBM (all strategies) |
+| **Higher-order** | Cubic + quadratic: ∑Aᵢⱼₖxᵢxⱼxₖ + xᵀBx. | ``CubicOptimizer`` | Hessian analysis only |
 
-Each problem type has a dedicated converter in ``src/sbm/problems.py``:
-``maxcut_to_ising``, ``bmincut_to_ising``, ``tsp_to_ising``.
+All converters live in :mod:`src.sbm.problems` (except ``CubicOptimizer`` which
+is in :mod:`src.sbm.higher_order`).
 
 ## Solvers
 
@@ -101,19 +104,26 @@ qubo-solver/
 │   ├── fem/           ── mean-field annealing
 │   └── sbm/
 │       ├── sbm.py          ── BaseSolver, strategies, mixins, Solver
-│       ├── problems.py     ── maxcut_to_ising, bmincut_to_ising, tsp_to_ising, dt_grid
+│       ├── problems.py     ── maxcut_to_ising, bmincut_to_ising, max3sat_to_ising,
+│       │                       tsp_to_ising, qubo_to_ising, qplib_to_ising, dt_grid
+│       ├── higher_order.py ── CubicOptimizer (cubic + quadratic objective)
 │       ├── _legacy.py      ── bsb_torch_batch (backward compat)
 │       └── _legacy_gsb.py  ── gsb_batch (backward compat)
 ├── tests/
 │   ├── test_unified_solver.py
-│   └── test_benchmark_solvers.py
+│   ├── test_benchmark_solvers.py
+│   ├── test_adaptive_annealing.py
+│   ├── test_problems.py        ── all problem-type converters
+│   └── test_higher_order.py    ── CubicOptimizer
 ├── config/
 └── doc/
 ```
 
 ## Latest Updates
 
-- **Problem types**: dedicated converters for MaxCut, Balanced MinCut, TSP (``problems.py``).
+- **More problem types**: Max-3SAT, QUBO, QPLIB + higher-order (``problems.py``, ``higher_order.py``).
+- **Problem tests**: new ``test_problems.py`` (23 tests) covering all converters + solvers.
+- **TSP legalizer**: ``tsp_extract_with_legalizer`` repairs invalid tours via greedy search.
 - **dt scanning**: ``dt_grid("bsb")`` returns recommended dt ranges per strategy.
 - **GSB**: typical best ``A`` is 0.2–0.4 (Goto et al. 2025).
 - **Adaptive annealing (FEM)**: per-variable β_i modulated by certainty.
