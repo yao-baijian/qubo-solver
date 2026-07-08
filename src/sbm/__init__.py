@@ -20,8 +20,10 @@ from .sbm import (
     BSBStrategy, DSBStrategy, AdiabaticStrategy, DigCIMStrategy,
     GSBMixin, GGSBMixin, QuantizationMixin,
 )
+from . import problems
 from ._legacy import bsb_torch_batch, bsb_bmincut_batch
 from ._legacy_gsb import gsb_batch
+from .problems import maxcut_to_ising, bmincut_to_ising, tsp_to_ising, dt_grid, scale_grid
 
 import numpy as np
 
