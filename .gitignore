@@ -8,6 +8,9 @@ __pycache__/
 *.egg
 
 # Build / dist
+
+# Benchmark results (run-specific CSVs)
+benchmark_results/
 build/
 dist/
 *.whl

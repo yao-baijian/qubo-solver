@@ -1,14 +1,21 @@
-"""Comprehensive benchmark: all SB methods + FEM on standard Ising problems.
+"""
+Comprehensive benchmark: all SB methods on standard Ising problems.
 
-For each **main method** (BSB, DSB, Adiabatic, DigCIM), runs a grid over
-sub-options (GSB strength ``A``, GGSB interval ``k``, quantisation bits)
-and writes a per-method CSV.  A final summary CSV collects the best result
-across all methods for each problem.
+For each **main method** (BSB, DSB, Adiabatic, DigCIM), runs a grid over:
+
+- **dt** — time-step values from :func:`sbm.problems.dt_grid`
+- **A** — GSB strength (0.0, 0.25, 0.5, 0.75, 1.0)
+- **GGSB** — global guidance strength (0.01, 0.05, 0.1) with k=20
+- **Quantisation** — fixed-point bits (4, 8)
+
+Writes a per-method CSV and a summary ``best.csv``.  Problem instances are
+loaded from ``benchmarks/instances/`` (centralised in this repo).
 
 Usage::
 
     python -m tests.test_benchmark_solvers            # default
     python -m tests.test_benchmark_solvers --quick     # small, fast
+    python -m tests.test_benchmark_solvers --dense     # dense dt grid
 """
 
 from __future__ import annotations
@@ -17,9 +24,9 @@ import argparse
 import csv
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import torch
 
@@ -35,13 +42,14 @@ from src.sbm import (  # noqa: E402
     GSBMixin, GGSBMixin, QuantizationMixin,
     bsb_torch_batch,
 )
+from src.sbm.problems import dt_grid  # noqa: E402
 from src.fem import FemSolver  # noqa: E402
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 1. Problem loaders
+# 1. Problem loaders  (instances live under benchmarks/instances/)
 # ═══════════════════════════════════════════════════════════════════════════
 
-BENCHMARK_ROOT = Path(r"C:\project\Hybird-Ising-Partition\benchmarks")
+BENCHMARK_ROOT = ROOT / "benchmarks" / "instances"
 
 
 @dataclass
@@ -218,38 +226,45 @@ def _build_enhancements(A=None, k=None, strength=None, num_bits=None):
 
 def _run_grid(method_name: str, strategy_cls, prob: Problem,
               device: str, iters: int, trials: int,
-              dt: float = 0.1,
+              dt_values: Optional[List[float]] = None,
               gsb_grid: Optional[List[float]] = None,
               ggsb_strengths: Optional[List[float]] = None,
               quant_bits: Optional[List[int]] = None,
               max_combos: int = 30) -> List[Result]:
-    """Cartesian-product grid search over sub-options for a given strategy.
+    """Cartesian-product grid search over dt × sub-options.
 
-    Sub-options are orthogonal — any combination of GSB, GGSB, and Quant
-    can coexist.  ``None`` is always included for each dimension (meaning
-    "not used"), giving the baseline as one row.
+    ``dt_values`` are taken from :func:`dt_grid` by default.  Sub-options
+    (GSB ``A``, GGSB, Quantisation) are orthogonal — any combination can
+    coexist.  ``None`` is always included for each dimension (meaning "not
+    used"), giving the baseline as one row.
     """
-    # Build lists with None as "not used"
+    if dt_values is None:
+        dt_values = dt_grid(method_name.lower())
+
+    # Build lists with None as "not used" for sub-options
     A_values = [None] + (gsb_grid or [])
     ggsb_values = [None] + ([{"k": 20, "s": s} for s in (ggsb_strengths or [])])
     quant_values = [None] + (quant_bits or [])
 
     # Cartesian product
     combos = []
-    for A in A_values:
-        for gg in ggsb_values:
-            for bits in quant_values:
-                combos.append((A, gg, bits))
+    for dt in dt_values:
+        for A in A_values:
+            for gg in ggsb_values:
+                for bits in quant_values:
+                    combos.append((dt, A, gg, bits))
 
     # Limit combos for quick runs
     if len(combos) > max_combos:
         import random
         random.seed(0)
-        # always keep baseline (all None)
-        combos = [(None, None, None)] + random.sample(combos[1:], max_combos - 1)
+        # always keep at least one baseline per dt value
+        baselines = [(dt, None, None, None) for dt in dt_values]
+        rest = [c for c in combos if c not in baselines]
+        combos = baselines + random.sample(rest, max_combos - len(baselines))
 
     results: List[Result] = []
-    for A, gg, bits in combos:
+    for dt, A, gg, bits in combos:
         k = gg["k"] if gg else None
         s = gg["s"] if gg else None
         enh = _build_enhancements(A=A, k=k, strength=s, num_bits=bits)
@@ -266,6 +281,7 @@ def _run_grid(method_name: str, strategy_cls, prob: Problem,
 
 def run_bsb(prob: Problem, device: str, iters: int, trials: int) -> List[Result]:
     return _run_grid("BSB", BSBStrategy, prob, device, iters, trials,
+                     dt_values=dt_grid("bsb"),
                      gsb_grid=[0.0, 0.25, 0.5, 0.75, 1.0],
                      ggsb_strengths=[0.01, 0.05, 0.1],
                      quant_bits=[4, 8])
@@ -273,6 +289,7 @@ def run_bsb(prob: Problem, device: str, iters: int, trials: int) -> List[Result]
 
 def run_dsb(prob: Problem, device: str, iters: int, trials: int) -> List[Result]:
     return _run_grid("DSB", DSBStrategy, prob, device, iters, trials,
+                     dt_values=dt_grid("dsb"),
                      gsb_grid=[0.0, 0.5, 1.0],
                      ggsb_strengths=[0.01, 0.05, 0.1],
                      quant_bits=[4, 8],
@@ -281,6 +298,7 @@ def run_dsb(prob: Problem, device: str, iters: int, trials: int) -> List[Result]
 
 def run_adiabatic(prob: Problem, device: str, iters: int, trials: int) -> List[Result]:
     return _run_grid("Adiabatic", AdiabaticStrategy, prob, device, iters, trials,
+                     dt_values=dt_grid("adiabatic"),
                      gsb_grid=[0.0, 0.5, 1.0],
                      ggsb_strengths=[0.01, 0.05, 0.1],
                      max_combos=15)
@@ -288,6 +306,7 @@ def run_adiabatic(prob: Problem, device: str, iters: int, trials: int) -> List[R
 
 def run_digcim(prob: Problem, device: str, iters: int, trials: int) -> List[Result]:
     return _run_grid("DigCIM", DigCIMStrategy, prob, device, iters, trials,
+                     dt_values=dt_grid("digcim"),
                      gsb_grid=[0.0, 0.5, 1.0],
                      ggsb_strengths=[0.01, 0.05, 0.1],
                      max_combos=15)
@@ -335,9 +354,22 @@ def run_fem(prob: Problem, device: str, iters: int, trials: int) -> List[Result]
 
 def main():
     parser = argparse.ArgumentParser(description="QUBO solver benchmark suite")
-    parser.add_argument("--quick", action="store_true", help="Quick run")
+    parser.add_argument("--quick", action="store_true", help="Quick run (2 instances, fewer combos)")
+    parser.add_argument("--dense", action="store_true",
+                        help="Dense dt grid (smaller step for more precision)")
     parser.add_argument("--device", default="cpu", help="Torch device")
     args = parser.parse_args()
+
+    # Override dt_grid if --dense
+    if args.dense:
+        import src.sbm.problems as _probs
+        # store the original, replace with a finer grid
+        _orig_grid = _probs.dt_grid
+        def _dense_grid(algo):
+            base = _orig_grid(algo)
+            step = base[1] - base[0] if len(base) > 1 else 0.05
+            return [round(base[0] + i * step / 2, 3) for i in range(len(base) * 2 - 1)]
+        _probs.dt_grid = _dense_grid
 
     iters, trials = (100, 4) if args.quick else (300, 8)
 
