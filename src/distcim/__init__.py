@@ -68,6 +68,10 @@ def solve_ising(
     noise_scale: float = 1.0,
     device: str = "cpu",
     quantize_bits: Optional[int] = None,
+    x_bits: Optional[int] = None,
+    y_bits: Optional[int] = None,
+    x_scale: float = 1.0,
+    y_scale: float = 1.0,
     backend: str = "emulated",
 ) -> Tuple[np.ndarray, float]:
     """Solve an Ising problem with (optionally distributed) SimCIM.
@@ -83,6 +87,12 @@ def solve_ising(
         ``SimplifiedSimCIM``); ``nparts>1`` uses the DistIM partition.
     quantize_bits : int or None
         Fixed-point width of the exchanged inter-module message.
+    x_bits, y_bits : int or None
+        FPGA state quantization at every step: ``x`` (c-component) to
+        ``x_bits`` (hardware: 8) and ``y`` (s-component) to ``y_bits``
+        (hardware: 16 or 32); control params stay float. ``None`` disables.
+    x_scale, y_scale : float
+        Full-scale range of the fixed-point grid for ``x`` / ``y``.
 
     Returns
     -------
@@ -108,6 +118,10 @@ def solve_ising(
         noise_scale=noise_scale,
         device=device,
         quantize_bits=quantize_bits,
+        x_bits=x_bits,
+        y_bits=y_bits,
+        x_scale=x_scale,
+        y_scale=y_scale,
         backend=backend,
     )
     spins, energy = engine.run()
@@ -136,6 +150,10 @@ class SimCimSolver:
         pmax: float = 1.1,
         seed: int = 0,
         device: str = "cpu",
+        x_bits: Optional[int] = None,
+        y_bits: Optional[int] = None,
+        x_scale: float = 1.0,
+        y_scale: float = 1.0,
     ):
         self.num_iters = num_iters
         self.dt = dt
@@ -147,6 +165,10 @@ class SimCimSolver:
         self.pmax = pmax
         self.seed = seed
         self.device = device
+        self.x_bits = x_bits
+        self.y_bits = y_bits
+        self.x_scale = x_scale
+        self.y_scale = y_scale
 
     def solve(self, Q, num_vars) -> List[int]:
         Q_mat = _build_matrix(Q, num_vars)
@@ -156,6 +178,8 @@ class SimCimSolver:
             xi=self.xi, A_init=self.A_init, As=self.As, dt=self.dt,
             pump=self.pump, pmax=self.pmax, num_iters=self.num_iters,
             seed=self.seed, device=self.device,
+            x_bits=self.x_bits, y_bits=self.y_bits,
+            x_scale=self.x_scale, y_scale=self.y_scale,
         )
         return (spins > 0).astype(int).tolist()
 
@@ -164,7 +188,8 @@ class DistCimSolver:
     """Distributed DistIM QUBO solver (multi-module sparse synchronization).
 
     Additional options: ``nparts``, ``scheme`` (standard/const/pulse),
-    ``time_intvl`` (sync period K) and ``quantize_bits`` (message precision).
+    ``time_intvl`` (sync period K), ``quantize_bits`` (message precision) and
+    ``x_bits``/``y_bits`` (FPGA state quantization of x/y at every step).
     """
 
     def __init__(
@@ -181,6 +206,10 @@ class DistCimSolver:
         scheme: str = "const",
         time_intvl: int = 10,
         quantize_bits: Optional[int] = None,
+        x_bits: Optional[int] = None,
+        y_bits: Optional[int] = None,
+        x_scale: float = 1.0,
+        y_scale: float = 1.0,
         seed: int = 0,
         device: str = "cpu",
         backend: str = "emulated",
@@ -197,6 +226,10 @@ class DistCimSolver:
         self.scheme = scheme
         self.time_intvl = time_intvl
         self.quantize_bits = quantize_bits
+        self.x_bits = x_bits
+        self.y_bits = y_bits
+        self.x_scale = x_scale
+        self.y_scale = y_scale
         self.seed = seed
         self.device = device
         self.backend = backend
@@ -210,6 +243,8 @@ class DistCimSolver:
             A_init=self.A_init, As=self.As, dt=self.dt, pump=self.pump,
             pmax=self.pmax, num_iters=self.num_iters, seed=self.seed,
             device=self.device, quantize_bits=self.quantize_bits,
+            x_bits=self.x_bits, y_bits=self.y_bits,
+            x_scale=self.x_scale, y_scale=self.y_scale,
             backend=self.backend,
         )
         return (spins > 0).astype(int).tolist()

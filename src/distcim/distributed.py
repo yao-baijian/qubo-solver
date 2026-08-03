@@ -37,7 +37,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from .engines import SimCIMEngine, ising_energy
+from .engines import SimCIMEngine, ising_energy, quantize_fixed
 
 
 # --------------------------------------------------------------------------- #
@@ -55,22 +55,6 @@ def partition_columns(N: int, nparts: int) -> List[Tuple[int, int]]:
         slices.append((start, start + length))
         start += length
     return slices
-
-
-def quantize_fixed(x: torch.Tensor, bits: int, scale: float = 1.0) -> torch.Tensor:
-    """Uniform signed fixed-point quantization of a message to ``bits`` bits.
-
-    ``x`` is clamped to ``[-scale, scale]`` and rounded to
-    ``2 ** (bits - 1)`` levels (1 sign bit + ``bits - 1`` magnitude bits).
-    ``bits=None`` or ``scale=None`` returns ``x`` unchanged.
-    """
-    if bits is None or scale is None:
-        return x
-    if scale == 0.0:
-        return torch.zeros_like(x)
-    levels = float(2 ** (bits - 1))
-    q = (torch.clamp(x / scale, -1.0, 1.0) * levels).round() / levels * scale
-    return q
 
 
 def linear_schedule(num_iters: int, start: float, end: float, span: float):
@@ -269,7 +253,16 @@ class DistIMEngine:
         Multiplier for the noise term (verification helper; 0 => deterministic).
     device : str
     quantize_bits : int or None
-        If set, the inter-module message is quantized to this many bits.
+        If set, the inter-module message is quantized to this many bits
+        (communication link).
+    x_bits, y_bits : int or None
+        FPGA state quantization: the dynamical states are reduced to fixed
+        point at every step — ``x`` (c-component) to ``x_bits`` (hardware: 8)
+        and ``y`` (s-component, two-component models) to ``y_bits``
+        (hardware: 16 or 32). Control params (pump, xi, dt, As) stay float.
+        ``None`` disables state quantization (default).
+    x_scale, y_scale : float
+        Full-scale range of the fixed-point grid for ``x`` / ``y``.
     backend : str
         ``emulated`` (single process) or ``torch`` (real torch.distributed).
     """
@@ -293,6 +286,10 @@ class DistIMEngine:
         noise_scale: float = 1.0,
         device: str = "cpu",
         quantize_bits: Optional[int] = None,
+        x_bits: Optional[int] = None,
+        y_bits: Optional[int] = None,
+        x_scale: float = 1.0,
+        y_scale: float = 1.0,
         backend: str = "emulated",
         # torch backend overrides (when backend == "torch")
         rank: int = 0,
@@ -311,6 +308,10 @@ class DistIMEngine:
         self.num_iters = num_iters
         self.device = device
         self.quantize_bits = quantize_bits
+        self.x_bits = x_bits
+        self.y_bits = y_bits
+        self.x_scale = x_scale
+        self.y_scale = y_scale
         self.seed = seed
         self.noise_scale = noise_scale
 
@@ -359,6 +360,10 @@ class DistIMEngine:
                 model=self.model,
                 device=self.device,
                 noise_scale=self.noise_scale,
+                x_bits=self.x_bits,
+                y_bits=self.y_bits,
+                x_scale=self.x_scale,
+                y_scale=self.y_scale,
             )
             self.modules.append(engine)
             self.coordinator.states[m] = engine.c_comp
@@ -386,6 +391,10 @@ class DistIMEngine:
                 model=self.model,
                 device=self.device,
                 noise_scale=self.noise_scale,
+                x_bits=self.x_bits,
+                y_bits=self.y_bits,
+                x_scale=self.x_scale,
+                y_scale=self.y_scale,
             )
         ]
         self._start_idx = start_idx

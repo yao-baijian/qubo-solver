@@ -456,6 +456,65 @@ def level4(sim, num_cars, num_routes, num_iters, seed):
 
 
 # --------------------------------------------------------------------------- #
+def level5(N, num_iters, seeds, tol):
+    """FPGA state quantization: only x (->int8) and y (->int16/32) are
+    quantized at every step; control params (pump, xi, dt, As) stay float.
+    Check that quantized central ~ float32 and distributed+quantized ~
+    centralized+quantized (no fundamental difference; quantized runs may
+    benefit from a tuned dt -- see tools/check_traffic_quant.py)."""
+    print("\n=== Level 5: FPGA state quantization (x int8, y int16/32) ===")
+    torch.manual_seed(21)
+    J = torch.randn(N, N)
+    J = (J + J.T) / 2
+    J.fill_diagonal_(0)
+    h = torch.randn(N, 1) * 0.1
+
+    # 1-component: x -> int8
+    e0 = min(
+        solve_ising(J, h, nparts=1, num_iters=num_iters, seed=s)[1] for s in seeds
+    )
+    e1 = min(
+        solve_ising(J, h, nparts=1, num_iters=num_iters, seed=s, x_bits=8)[1]
+        for s in seeds
+    )
+    rel = abs(e1 - e0) / max(abs(e0), 1e-12)
+    record(
+        f"L5 x-int8 central within {tol:.0%} of float32",
+        rel <= tol, f"float={e0:.6f} q8={e1:.6f} rel={rel:.4%}",
+    )
+
+    # distributed + state quantization
+    e2 = min(
+        solve_ising(J, h, nparts=4, scheme="const", time_intvl=10,
+                    num_iters=num_iters, seed=s, x_bits=8)[1]
+        for s in seeds
+    )
+    rel2 = abs(e2 - e1) / max(abs(e1), 1e-12)
+    record(
+        "L5 dist-const K10 + x-int8 within "
+        f"{0.15:.0%} of central-q8",
+        rel2 <= 0.15, f"central-q8={e1:.6f} dist-q8={e2:.6f} rel={rel2:.4%}",
+    )
+
+    # 2-component SimCIM: x -> int8 and y -> int16
+    e0b = min(
+        solve_ising(J, h, model="SimCIM", num_iters=num_iters, seed=s)[1]
+        for s in seeds
+    )
+    e1b = min(
+        solve_ising(J, h, model="SimCIM", num_iters=num_iters, seed=s,
+                    x_bits=8, y_bits=16)[1]
+        for s in seeds
+    )
+    relb = abs(e1b - e0b) / max(abs(e0b), 1e-12)
+    record(
+        "L5 SimCIM x-int8/y-int16 within "
+        f"{0.15:.0%} of float32",
+        relb <= 0.15, f"float={e0b:.6f} q={e1b:.6f} rel={relb:.4%}",
+    )
+
+
+# --------------------------------------------------------------------------- #
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--quick", action="store_true",
@@ -476,6 +535,7 @@ def main():
     level2b(N=N, nparts=nparts, K=K, num_iters=iters)
     level3(N=N, nparts=nparts, K=K, num_iters=iters, seeds=seeds)
     level4(sim, num_cars=8, num_routes=4, num_iters=iters, seed=7)
+    level5(N=N, num_iters=iters, seeds=seeds, tol=0.10)
 
     print("\n=== SUMMARY ===")
     n_fail = 0

@@ -49,6 +49,22 @@ def inverse_interaction_rms(J: torch.Tensor, scale: float = 0.5):
     return scale / interaction_rms
 
 
+def quantize_fixed(x: torch.Tensor, bits: int, scale: float = 1.0) -> torch.Tensor:
+    """Uniform signed fixed-point quantization to ``bits`` bits.
+
+    ``x`` is clamped to ``[-scale, scale]`` and rounded onto a grid with
+    ``2 ** (bits - 1)`` magnitude levels (1 sign bit + ``bits - 1`` magnitude
+    bits). ``bits=None`` or ``scale=None`` returns ``x`` unchanged.
+    """
+    if bits is None or scale is None:
+        return x
+    if scale == 0.0:
+        return torch.zeros_like(x)
+    levels = float(2 ** (bits - 1))
+    q = (torch.clamp(x / scale, -1.0, 1.0) * levels).round() / levels * scale
+    return q
+
+
 class SimCIMEngine:
     """Central/per-module SimCIM engine.
 
@@ -68,6 +84,17 @@ class SimCIMEngine:
     seed : int or None
         If given, ``torch.manual_seed`` is called before the initial phase
         draw (same behaviour as a freshly seeded run of the target repo).
+    x_bits, y_bits : int or None
+        FPGA state quantization. Only the dynamical states are reduced to
+        fixed point at every step: ``x`` (position / c-component) to
+        ``x_bits`` (hardware: 8) and ``y`` (momentum / s-component, two-
+        component models only) to ``y_bits`` (hardware: 16 or 32). All
+        control parameters (pump ``p``, coupling gain ``xi``, time step
+        ``dt``, noise scale ``As``) stay in float/fixed-point. ``None``
+        disables state quantization (default — faithful float32 port).
+    x_scale, y_scale : float
+        Full-scale range of the fixed-point grid for ``x`` / ``y``
+        (``x`` is clipped to [-1, 1], so ``x_scale=1.0`` is natural).
     """
 
     TWO_COMP = {"StandardCIM": True, "SimCIM": True, "SimplifiedSimCIM": False}
@@ -87,6 +114,10 @@ class SimCIMEngine:
         device: str = "cpu",
         seed: Optional[int] = None,
         noise_scale: float = 1.0,
+        x_bits: Optional[int] = None,
+        y_bits: Optional[int] = None,
+        x_scale: float = 1.0,
+        y_scale: float = 1.0,
     ):
         if model not in self.TWO_COMP:
             raise ValueError(
@@ -103,6 +134,12 @@ class SimCIMEngine:
         self.cubic = self.CUBIC[model]
         self.device = device
         self.noise_scale = float(noise_scale)
+
+        # FPGA state quantization (only the states x / y are quantized).
+        self.x_bits = x_bits
+        self.y_bits = y_bits
+        self.x_scale = float(x_scale)
+        self.y_scale = float(y_scale)
 
         # Resolve xi (string modes come from the target repo's initializer).
         if isinstance(xi, str):
@@ -172,6 +209,13 @@ class SimCIMEngine:
             self.s_comp = self.s_comp + d_vars[1]
         if self.clip:
             self.c_comp = self.c_comp.clamp(-1.0, 1.0)
+
+        # FPGA state quantization: only x (c_comp) and y (s_comp) are reduced
+        # to fixed point every step; control params (p, xi, dt, As) stay float.
+        if self.x_bits is not None:
+            self.c_comp = quantize_fixed(self.c_comp, self.x_bits, self.x_scale)
+        if self.two_comp and self.y_bits is not None:
+            self.s_comp = quantize_fixed(self.s_comp, self.y_bits, self.y_scale)
 
     def set_p(self, value):
         """Set the pump rate for the current step."""

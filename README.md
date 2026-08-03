@@ -196,22 +196,37 @@ emulated backend above is the same math without the process group.
 
 ### Quantization
 
-Two orthogonal quantization points:
+Two orthogonal quantization points, both implemented:
 
-- **State quantization (hardware scheme)** — the dynamical state variables are
-  stored at reduced precision: `x` (position / c-component) at **int8** and `y`
-  (momentum / s-component) at **int16 or int32** where a second component
-  exists. All control parameters — pump `p`/`α`, coupling gain `ξ`, time step
-  `dt` — remain in **fixed-point or float** precision. Nothing else is
-  quantized. This is the scheme implemented in the FPGA.
-- **Message quantization (communication link)** — `quantize_bits` (currently
-  in the software) quantizes only the inter-module message `c_m` that crosses
-  the network (fixed-point, dynamic range), modelling a low-precision
-  communication link. It is orthogonal to state quantization.
+- **State quantization (FPGA scheme)** — the dynamical state variables are
+  reduced to fixed point at every step: `x` (position / c-component) to
+  **int8** and `y` (momentum / s-component, two-component models) to
+  **int16 or int32**. All control parameters — pump `p`/`α`, coupling gain
+  `ξ`, time step `dt`, noise scale `As` — remain in **fixed-point or float**
+  precision. Enable with `x_bits` / `y_bits`:
 
-Verification shows quantizing the exchanged message (8/16 bit) does not
-degrade the solution, and that the distributed + quantized machine reproduces
-the original (centralized) one.
+  ```python
+  from src import DistCimSolver
+
+  solver = DistCimSolver(nparts=4, scheme="const", time_intvl=10,
+                         x_bits=8, y_bits=16, num_iters=1000)
+  solution = solver.solve(Q, num_vars=1000)
+  ```
+
+  Quantization changes the trajectory slightly, so the quantized run may need
+  a **tuned `dt`** (the quantized dynamics behave like a slightly different
+  machine). On the traffic check, `x`-int8 with `dt=0.2–0.5` matches or beats
+  the float32 run; see `tools/check_traffic_quant.py`.
+
+- **Message quantization (communication link)** — `quantize_bits` quantizes
+  only the inter-module message `c_m` that crosses the network (fixed-point,
+  dynamic range), modelling a low-precision communication link. It is
+  orthogonal to state quantization and both can be combined.
+
+Verification (Levels 3 & 5) shows neither quantization fundamentally changes
+the solution: message-quantized and state-quantized runs stay within a few %
+of the float32 centralized machine, and distributed + quantized reproduces
+the centralized + quantized result.
 
 ### Verification against the target repo
 
@@ -231,6 +246,9 @@ distributed + quantization behaves like the original code:
   target repo's `TrafficGenerator`/`TrafficFlow` (the Kowloon/HK construction),
   solved identically by both packages and improving congestion over default
   routing.
+- **Level 5** — FPGA state quantization: `x`→int8 (and `y`→int16 for the
+  two-component `SimCIM`) stays within a few % of the float32 machine, and
+  distributed + state-quantized reproduces the centralized + quantized result.
 
 ```bash
 python tools/verify_distim.py            # full run

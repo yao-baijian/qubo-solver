@@ -17,6 +17,7 @@ import torch
 
 from src.distcim import DistCimSolver, SimCimSolver, solve_ising
 from src.distcim.distributed import (
+    DistIMEngine,
     _EmulatedCoordinator,
     partition_columns,
     quantize_fixed,
@@ -144,3 +145,44 @@ def test_registry_methods_registered():
     register_distcim_methods()
     for name in ["distcim", "distcim-const", "distcim-pulse"]:
         assert name in registry.list_methods()
+
+
+# --------------------------------------------------------------------------- #
+# FPGA state quantization (x -> int8, y -> int16/32; params stay float)
+# --------------------------------------------------------------------------- #
+def test_state_quantized_x_lies_on_int8_grid():
+    """After each step with x_bits=8, c_comp lies on the 1/128 grid in [-1,1]."""
+    J, h = _random_ising(16, seed=3)
+    eng = DistIMEngine(J=J, h=h, nparts=1, num_iters=50, x_bits=8, seed=1)
+    eng.run()
+    c = eng.modules[0].c_comp
+    grid = (c * 128).round() / 128
+    assert torch.allclose(c, grid, atol=1e-6)
+    assert c.abs().max().item() <= 1.0 + 1e-6
+
+
+def test_state_quantized_x_matches_float32_within_tolerance():
+    J, h = _random_ising(24, seed=5)
+    _, e0 = solve_ising(J, h, num_iters=500, seed=6)
+    _, e1 = solve_ising(J, h, num_iters=500, seed=6, x_bits=8)
+    rel = abs(e1 - e0) / max(abs(e0), 1e-12)
+    assert rel < 0.10
+
+
+def test_state_quantized_distributed_close_to_central_quantized():
+    J, h = _random_ising(24, seed=5)
+    _, ec = solve_ising(J, h, nparts=1, num_iters=500, seed=6, x_bits=8)
+    _, ed = solve_ising(J, h, nparts=4, scheme="const", time_intvl=10,
+                        num_iters=500, seed=6, x_bits=8)
+    rel = abs(ed - ec) / max(abs(ec), 1e-12)
+    assert rel < 0.15
+
+
+def test_two_component_y_quantization():
+    """SimCIM (2-comp): x->int8 and y->int16 together stay close to float32."""
+    J, h = _random_ising(20, seed=5)
+    _, e0 = solve_ising(J, h, model="SimCIM", num_iters=400, seed=6)
+    _, e1 = solve_ising(J, h, model="SimCIM", num_iters=400, seed=6,
+                        x_bits=8, y_bits=16)
+    rel = abs(e1 - e0) / max(abs(e0), 1e-12)
+    assert rel < 0.10
