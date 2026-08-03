@@ -30,6 +30,7 @@ from .sbm import (
     AdiabaticStrategy, DigCIMStrategy,
     GSBMixin, GGSBMixin, QuantizationMixin,
 )
+from .distcim import SimCimSolver, DistCimSolver, solve_ising
 
 __all__ = [
     "FemSolver", "SbmSolver",
@@ -37,4 +38,5 @@ __all__ = [
     "UpdateStrategy", "BSBStrategy", "DSBStrategy",
     "AdiabaticStrategy", "DigCIMStrategy",
     "GSBMixin", "GGSBMixin", "QuantizationMixin",
+    "SimCimSolver", "DistCimSolver", "solve_ising",
 ]

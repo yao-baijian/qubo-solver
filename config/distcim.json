@@ -1,0 +1,17 @@
+{
+    "description": "DISTCIM (DistIM) solver — distributed Simulated Coherent Ising Machine with sparse synchronization (paper: Distributed Ising dynamics for real-time large-scale combinatorial optimization)",
+    "num_iters": 1000,
+    "dt": 0.1,
+    "As": 70.0,
+    "A_init": 0.001,
+    "xi": 1.0,
+    "model": "SimplifiedSimCIM",
+    "pump": "constant",
+    "pmax": 1.1,
+    "nparts": 4,
+    "scheme": "const",
+    "time_intvl": 10,
+    "quantize_bits": null,
+    "seed": 0,
+    "device": "cpu"
+}

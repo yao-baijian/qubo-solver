@@ -45,6 +45,10 @@ is in :mod:`src.sbm.higher_order`).
 > **Tip**: When using GSB, scan ``A ∈ [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]``.
 > The best PS rate typically occurs in the 0.2–0.4 range (Goto et al. 2025).
 
+| Solver | Description |
+|---|---|
+| **DISTCIM** | DistIM — distributed Simulated Coherent Ising Machine with sparse synchronization |
+
 ## Installation
 
 ```bash
@@ -87,6 +91,160 @@ for dt in dt_grid("bsb"):                # 0.10 to 1.25 step 0.05
     base = BaseSolver(strategy=BSBStrategy(dt=dt), ...)
 ```
 
+## DISTCIM — distributed SimCIM (DistIM)
+
+Implements the sparse-synchronization distributed Ising dynamics from the
+paper *"Distributed Ising dynamics for real-time large-scale combinatorial
+optimization"* (DistIM) on top of a faithful SimCIM engine — an exact port of
+the `simulated-ising-machine` reference repo, verified bit-for-bit against it
+(see *Verification* below).
+
+### Problem and dynamics
+
+We minimise the Ising Hamiltonian over spins σ ∈ {−1, +1}^N
+
+$$
+H(\sigma) = -\tfrac{1}{2}\,\sigma^T J\,\sigma - h^T\sigma,
+$$
+
+with symmetric coupling `J` and bias `h`, using the SimCIM dynamics
+(paper Methods 3.2, Eqs. 8–11):
+
+$$
+dx = \big[(p-1)\,x + \xi\,(Jx + h)\big]\,dt
+     + \tfrac{1}{A_s}\sqrt{x^2 + \tfrac12}\;dW,
+\qquad x \leftarrow \operatorname{clip}(x,\,-1,\,+1),
+$$
+
+read out at the end as σ = sign(x). Here `p` is the pump (ramped 0 → pmax), ξ
+the coupling gain, `A_s` the inverse noise scale, `dt` the Euler–Maruyama step.
+
+### Distributed computation — the math
+
+The `N` variables are split by **columns** into `nparts` modules. Module `m`
+owns the variable block `S_m` (size `n_m`), the column slice
+`J_part = J[:, S_m]` (N×n_m) and the bias slice `h_part = h[S_m]`. Splitting
+`J = J_local + J_cross`, the coupling field on module `m`'s rows is
+(paper Eqs. 12–13):
+
+$$
+(Jx)_{S_m} \;=\; \underbrace{J_m\,x_m}_{\text{local (exact, every step)}}
+\;+\;
+\underbrace{\sum_{m'\neq m} J_{mm'}\,x_{m'}}_{\,c_m \;=\; \text{inter-module message}},
+\qquad J_m = J[S_m,S_m],\quad J_{mm'} = J[S_m,S_{m'}].
+$$
+
+The **full local field** fed into the dynamics is therefore
+
+$$
+\text{field}_m \;=\; \underbrace{J_m x_m + c_m}_{\text{coupling}} \;+\; h_m,
+$$
+
+and the **only quantity exchanged between modules** is the message
+`c_m = Σ_{m'≠m} J_{mm'} x_{m'}` — formed by all-reducing each module's
+contribution `J[:, S_{m'}] x_{m'}` and taking the local rows. The bias `h_m` is
+**purely local** (partitioned by rows) and is never exchanged.
+
+Messages are refreshed every `time_intvl` (`K`) steps, using one of three
+schemes (paper Eqs. 14–16):
+
+| Scheme | at a sync step | between syncs |
+|---|---|---|
+| `standard` (K=1) | `field = J_m x_m + c_m + h_m` (all-reduce every step, exact) | — |
+| `const` | `field = J_m x_m + c_m + h_m` (message refreshed) | `field = J_m x_m + c_m^frozen + h_m` |
+| `pulse` | `field = J_m x_m + K·c_m^prev + h_m` (impulse) | `field = J_m x_m + h_m` |
+
+`standard` with `K=1` is exactly the centralized machine; `const` holds the
+last message between syncs; `pulse` drops the message off-sync and applies the
+previous one as a single impulse scaled by `K`.
+
+### How to run
+
+**Centralized** SimCIM (equivalent to the reference repo's `SimplifiedSimCIM`):
+
+```python
+from src import SimCimSolver
+
+solver = SimCimSolver(num_iters=1000, dt=0.1)
+solution = solver.solve(Q, num_vars=1000)     # list of 0/1
+```
+
+**Distributed** DistIM — single process, all modules emulated in one object
+(identical math to a real multi-process run, deterministic, runs on CPU):
+
+```python
+from src import DistCimSolver
+
+solver = DistCimSolver(nparts=4, scheme="const", time_intvl=10,
+                       quantize_bits=8, num_iters=1000)
+solution = solver.solve(Q, num_vars=1000)
+```
+
+**Low-level Ising interface** (used by the verification harness):
+
+```python
+from src import solve_ising
+
+spins, energy = solve_ising(J, h, nparts=4, scheme="const", time_intvl=10,
+                            num_iters=1000, seed=0)   # spins in {-1, +1}
+```
+
+Real multi-GPU (`backend="torch"`) launches one process per module via
+`torch.distributed` (each rank loads its own `J_part`/`h_part` column slice,
+as in the reference repo's `tools/partition.py` + `torchrun` workflow). The
+emulated backend above is the same math without the process group.
+
+### Quantization
+
+Two orthogonal quantization points:
+
+- **State quantization (hardware scheme)** — the dynamical state variables are
+  stored at reduced precision: `x` (position / c-component) at **int8** and `y`
+  (momentum / s-component) at **int16 or int32** where a second component
+  exists. All control parameters — pump `p`/`α`, coupling gain `ξ`, time step
+  `dt` — remain in **fixed-point or float** precision. Nothing else is
+  quantized. This is the scheme implemented in the FPGA.
+- **Message quantization (communication link)** — `quantize_bits` (currently
+  in the software) quantizes only the inter-module message `c_m` that crosses
+  the network (fixed-point, dynamic range), modelling a low-precision
+  communication link. It is orthogonal to state quantization.
+
+Verification shows quantizing the exchanged message (8/16 bit) does not
+degrade the solution, and that the distributed + quantized machine reproduces
+the original (centralized) one.
+
+### Verification against the target repo
+
+`tools/verify_distim.py` verifies that this package reproduces the
+*simulated-ising-machine* repo (the DistIM reference implementation) and that
+distributed + quantization behaves like the original code:
+
+- **Level 1** — bit-exact match with the target repo's `SimplifiedSimCIM`,
+  `StandardCIM`, `SimCIM` (same seed / op order).
+- **Level 2** — DistIM field math matches the paper equations; noiseless
+  distributed `standard`/`const` with `K=1` are bit-exact vs an independent
+  partitioned-centralized reference.
+- **Level 3** — `const`/`pulse` with `K>1` stay within a few % of centralized
+  while exchanging `K`× fewer messages; 8/16-bit message quantization does not
+  degrade the solution.
+- **Level 4** — a small synthetic traffic-flow instance built through the
+  target repo's `TrafficGenerator`/`TrafficFlow` (the Kowloon/HK construction),
+  solved identically by both packages and improving congestion over default
+  routing.
+
+```bash
+python tools/verify_distim.py            # full run
+python tools/verify_distim.py --quick    # smaller instances
+```
+
+The target repo is imported in-process with stubs for its Ascend-NPU / C++
+extensions (only needed for SA/HT models); set `SIM_TARGET_REPO` to point at
+another checkout. Unit tests (no target repo needed):
+
+```bash
+python -m pytest tests/test_distcim.py
+```
+
 ## Git Submodule Usage
 
 ```bash
@@ -102,6 +260,7 @@ qubo-solver/
 ├── src/
 │   ├── __init__.py
 │   ├── fem/           ── mean-field annealing
+│   ├── distcim/       ── DistIM distributed SimCIM (standard/const/pulse + quantization)
 │   └── sbm/
 │       ├── sbm.py          ── BaseSolver, strategies, mixins, Solver
 │       ├── problems.py     ── maxcut_to_ising, bmincut_to_ising, max3sat_to_ising,
@@ -113,6 +272,7 @@ qubo-solver/
 │   ├── test_unified_solver.py
 │   ├── test_benchmark_solvers.py
 │   ├── test_adaptive_annealing.py
+│   ├── test_distcim.py
 │   ├── test_problems.py        ── all problem-type converters
 │   └── test_higher_order.py    ── CubicOptimizer
 ├── config/
