@@ -263,6 +263,67 @@ another checkout. Unit tests (no target repo needed):
 python -m pytest tests/test_distcim.py
 ```
 
+### Benchmarks — how to run
+
+All scripts run on CPU with dense `J` (keep `N` ≤ ~5000 per run). Dependencies:
+`torch`, `numpy`, `scipy`, `yacs`, `numba`, `networkx`. The
+`simulated-ising-machine` reference repo is imported in-process with stubs
+(see *Verification* above).
+
+#### Traffic flow
+
+Small synthetic instance (fast, ~1 min) — original vs quantized vs distributed
+(K=1/5/10), best-dt sweep over dt in 0.1..1.3 (step 0.1):
+
+```bash
+python tools/check_traffic_quant.py
+```
+
+Realistic instance (target-repo `TrafficGenerator`/`TrafficFlow` construction;
+~5000 vars / dense 5000×5000). The instance is generated once and cached to
+disk; the full best-dt sweep takes ~15–30 min (parallel workers):
+
+```bash
+python tools/benchmark_traffic_realistic.py                                # 1250 cars -> ~5100 vars
+python tools/benchmark_traffic_realistic.py --cars 400 --iters 200 --workers 4   # quick check
+# options: --cars --routes --iters --dts --seeds --workers
+```
+
+Output: per-config best congestion/energy and `benchmark_results/traffic_realistic/results.md`.
+
+#### Gset MaxCut (ground state)
+
+All 71 Gset instances, best-dt sweep (0.1..1.3 step 0.1), iters 1000/3000/5000,
+for float32 / quant8 / distributed-quant8. **Heavy on CPU** — the fine grid ×
+71 instances can take hours, so spot-check a few instances first:
+
+```bash
+python tools/benchmark_gset_distcim.py --instances G1 G6 G11 --workers 4   # spot check
+python tools/benchmark_gset_distcim.py --workers 8                         # full sweep
+# options: --instances --dts --seeds --iters --no-dist --workers
+```
+
+Note: the `const` scheme with K≥10 can collapse to a uniform spin state on
+some instances (genuine reference-repo behaviour, verified on 4 real ranks
+with `tools/run_target_dist_g1.py`); the distributed column therefore uses K=5.
+
+Output: `benchmark_results/gset_distcim_compare.csv`.
+
+#### Reference-repo distributed check (4 real ranks)
+
+```bash
+python tools/run_target_dist_g1.py    # target repo Standard/ConstApprox with 4 torch.distributed ranks on G1
+```
+
+#### Collect the results record
+
+```bash
+python tools/collect_results.py       # writes benchmark_results/RESULTS.md
+```
+
+`benchmark_results/` is git-ignored (run-specific CSVs); `RESULTS.md` is the
+curated record and is force-added (`git add -f`) when committing.
+
 ## Git Submodule Usage
 
 ```bash
@@ -286,6 +347,14 @@ qubo-solver/
 │       ├── higher_order.py ── CubicOptimizer (cubic + quadratic objective)
 │       ├── _legacy.py      ── bsb_torch_batch (backward compat)
 │       └── _legacy_gsb.py  ── gsb_batch (backward compat)
+├── tools/
+│   ├── verify_distim.py             ── 5-level verification vs the reference repo
+│   ├── check_traffic_quant.py       ── small traffic: original vs quant vs dist (K)
+│   ├── benchmark_traffic_realistic.py ── ~5000-var realistic traffic benchmark
+│   ├── benchmark_gset_distcim.py    ── full Gset MaxCut benchmark
+│   ├── run_target_dist_g1.py        ── reference repo distributed check (4 ranks)
+│   ├── target_repo.py               ── in-process import of the reference repo (stubs)
+│   └── collect_results.py           ── writes benchmark_results/RESULTS.md
 ├── tests/
 │   ├── test_unified_solver.py
 │   ├── test_benchmark_solvers.py
