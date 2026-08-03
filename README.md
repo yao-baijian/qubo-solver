@@ -18,6 +18,23 @@ and **Ising** problems, with a unified, composable architecture.
 All converters live in :mod:`src.sbm.problems` (except ``CubicOptimizer`` which
 is in :mod:`src.sbm.higher_order`).
 
+## benckmarks
+
+[Gset](https://web.stanford.edu/~yyye/yyye/Gset/)
+
+[COLOR](http://mat.gsia.cmu.edu/COLOR/instances.html)
+
+[SATLIB](http://www.satlib.org/)
+
+[qplib](https://qplib.zib.de/)
+
+[TSPLIB](http://comopt.ifi.uni-heidelberg.de/software/TSPLIB95/)
+
+[Transportation Networks]()
+
+[SuiteSparse Matrix Collection](https://suitesparse-collection-website.herokuapp.com/Gset)
+
+
 ## Solvers
 
 | Solver | Method | Best for |
