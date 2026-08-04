@@ -20,19 +20,15 @@ is in :mod:`src.sbm.higher_order`).
 
 ## benckmarks
 
-[Gset](https://web.stanford.edu/~yyye/yyye/Gset/)
-
-[COLOR](http://mat.gsia.cmu.edu/COLOR/instances.html)
-
-[SATLIB](http://www.satlib.org/)
-
-[qplib](https://qplib.zib.de/)
-
-[TSPLIB](http://comopt.ifi.uni-heidelberg.de/software/TSPLIB95/)
-
-[Transportation Networks]()
-
-[SuiteSparse Matrix Collection](https://suitesparse-collection-website.herokuapp.com/Gset)
+| Benchmark | Best-known |
+|--------|--------|
+| [Gset](https://web.stanford.edu/~yyye/yyye/Gset/) | [max-cut](https://huggingface.co/datasets/Yuma-Ichikawa/qqa4co-bench) |
+| [COLOR](http://mat.gsia.cmu.edu/COLOR/instances.html) | [Vertex-coloring](https://cedric.cnam.fr/~porumbed/graphs/) |
+| [SATLIB](http://www.satlib.org/) | [SAT](https://www.cril.univ-artois.fr/) |
+| [qplib](https://qplib.zib.de/) | [qplib-bestknown](https://arxiv.org/pdf/2508.01299) |
+| [TSPLIB](http://comopt.ifi.uni-heidelberg.de/software/TSPLIB95/) | [TSP](https://comopt.ifi.uni-heidelberg.de/software/TSPLIB95/) |
+| [Transportation Networks]()  | |
+| [SuiteSparse Matrix Collection](https://suitesparse-collection-website.herokuapp.com/Gset)  | |
 
 
 ## Solvers
