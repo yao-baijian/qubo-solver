@@ -49,6 +49,24 @@ from src.distcim.cupy_engine import (  # noqa: E402
 def _worker(rank, nproc, host, port, args, q):
     import cupy as cp
     import cupyx.distributed
+    if rank == 0:
+        # NCCL must be compiled into cupy (Linux wheels bundle it; Windows
+        # wheels do not). Fail with a clear message instead of a cryptic one.
+        try:
+            import cupy.cuda.nccl as _nccl
+            if not _nccl.available:
+                raise RuntimeError
+        except Exception:
+            msg = ("this cupy build has no NCCL support "
+                   "(cupy.cuda.nccl.available is False). Multi-GPU needs a "
+                   "cupy wheel built with NCCL — on Linux install "
+                   "`pip install cupy-cuda12x`; on Windows NCCL is not "
+                   "bundled. Use the single-GPU emulated backend "
+                   "(tools/benchmark_distcim_precision.py) until the "
+                   "cluster is available.")
+            print("ERROR: " + msg)
+            q.put(dict(error=msg))
+            return
     cp.cuda.Device(rank).use()
     comm = cupyx.distributed.init_process_group(
         nproc, rank, host=host, port=port)
@@ -121,6 +139,12 @@ def main():
     results = [q.get(timeout=3600) for _ in procs]
     for p in procs:
         p.join()
+
+    if any("error" in r for r in results):
+        for r in results:
+            if "error" in r:
+                print("ERROR:", r["error"])
+        sys.exit(1)
 
     r0 = results[0]
     baseline = _baseline_congestion(args)

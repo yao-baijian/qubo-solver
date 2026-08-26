@@ -288,7 +288,18 @@ def test_cupy_precisions_run():
         assert spins.shape == (20,)
 
 
+def _nccl_available():
+    try:
+        import cupy.cuda.nccl  # noqa: F401
+        return bool(cupy.cuda.nccl.available)  # type: ignore[attr-defined]
+    except Exception:
+        return False
+
+
 @pytest.mark.skipif(not _cupy_available(), reason="cupy not installed")
+@pytest.mark.skipif(not _nccl_available(),
+                    reason="cupy built without NCCL (Windows wheel); "
+                           "multi-GPU runs on a Linux cupy-cuda12x install")
 def test_cupy_nccl_single_rank_matches_emulated():
     """Single-rank CuPy-NCCL multi-GPU path reproduces the emulated solve.
 
