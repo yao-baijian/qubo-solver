@@ -26,6 +26,7 @@ from .engines import (
     SimCIMEngine,
     ising_energy,
 )
+from .precision import PRECISIONS, PrecisionMatmul
 
 
 def qubo_to_ising(Q: torch.Tensor):
@@ -72,6 +73,7 @@ def solve_ising(
     y_bits: Optional[int] = None,
     x_scale: float = 1.0,
     y_scale: float = 1.0,
+    precision: Optional[str] = None,
     backend: str = "emulated",
 ) -> Tuple[np.ndarray, float]:
     """Solve an Ising problem with (optionally distributed) SimCIM.
@@ -93,6 +95,10 @@ def solve_ising(
         (hardware: 16 or 32); control params stay float. ``None`` disables.
     x_scale, y_scale : float
         Full-scale range of the fixed-point grid for ``x`` / ``y``.
+    precision : str or None
+        Arithmetic precision of the coupling matmul ``J @ c`` (see
+        :mod:`src.distcim.precision`): ``fp32`` (default), ``fp16``, ``bf16``,
+        ``int8``, ``int4``, ``fp8``, ``fp4``.
 
     Returns
     -------
@@ -122,6 +128,7 @@ def solve_ising(
         y_bits=y_bits,
         x_scale=x_scale,
         y_scale=y_scale,
+        precision=precision,
         backend=backend,
     )
     spins, energy = engine.run()
@@ -154,6 +161,7 @@ class SimCimSolver:
         y_bits: Optional[int] = None,
         x_scale: float = 1.0,
         y_scale: float = 1.0,
+        precision: Optional[str] = None,
     ):
         self.num_iters = num_iters
         self.dt = dt
@@ -169,6 +177,7 @@ class SimCimSolver:
         self.y_bits = y_bits
         self.x_scale = x_scale
         self.y_scale = y_scale
+        self.precision = precision
 
     def solve(self, Q, num_vars) -> List[int]:
         Q_mat = _build_matrix(Q, num_vars)
@@ -180,6 +189,7 @@ class SimCimSolver:
             seed=self.seed, device=self.device,
             x_bits=self.x_bits, y_bits=self.y_bits,
             x_scale=self.x_scale, y_scale=self.y_scale,
+            precision=self.precision,
         )
         return (spins > 0).astype(int).tolist()
 
@@ -210,6 +220,7 @@ class DistCimSolver:
         y_bits: Optional[int] = None,
         x_scale: float = 1.0,
         y_scale: float = 1.0,
+        precision: Optional[str] = None,
         seed: int = 0,
         device: str = "cpu",
         backend: str = "emulated",
@@ -230,6 +241,7 @@ class DistCimSolver:
         self.y_bits = y_bits
         self.x_scale = x_scale
         self.y_scale = y_scale
+        self.precision = precision
         self.seed = seed
         self.device = device
         self.backend = backend
@@ -245,6 +257,7 @@ class DistCimSolver:
             device=self.device, quantize_bits=self.quantize_bits,
             x_bits=self.x_bits, y_bits=self.y_bits,
             x_scale=self.x_scale, y_scale=self.y_scale,
+            precision=self.precision,
             backend=self.backend,
         )
         return (spins > 0).astype(int).tolist()
@@ -259,4 +272,6 @@ __all__ = [
     "CentralFieldCoupler",
     "qubo_to_ising",
     "ising_energy",
+    "PRECISIONS",
+    "PrecisionMatmul",
 ]

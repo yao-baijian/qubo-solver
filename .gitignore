@@ -27,3 +27,4 @@ Thumbs.db
 # Benchmark output
 benchmark_results.csv
 benchmark_results/
+doc/*.tex

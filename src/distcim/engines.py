@@ -26,6 +26,8 @@ from typing import Callable, Optional
 
 import torch
 
+from .precision import PRECISIONS, PrecisionMatmul
+
 
 def random_circle_init(N: int, amplitude: float, device="cpu"):
     """Port of ``sim.initializers.base.RandomInitializer.random_circle_init``.
@@ -227,14 +229,19 @@ class SimCIMEngine:
 
 
 class CentralFieldCoupler:
-    """``J @ c + h`` — port of the target repo's QuadraticCoupler."""
+    """``J @ c + h`` — port of the target repo's QuadraticCoupler.
 
-    def __init__(self, J: torch.Tensor, h: torch.Tensor):
-        self.J = J
-        self.h = h
+    ``precision`` lowers the arithmetic precision of the ``J @ c`` product
+    (see :mod:`src.distcim.precision`); the field is returned in float32.
+    """
+
+    def __init__(self, J: torch.Tensor, h: torch.Tensor,
+                 precision: Optional[str] = None):
+        self.pm = PrecisionMatmul(J, precision, device=str(J.device))
+        self.h = h.to(J.device)
 
     def __call__(self, c_comp: torch.Tensor) -> torch.Tensor:
-        return torch.matmul(self.J, c_comp) + self.h
+        return self.pm(c_comp) + self.h
 
 
 def ising_energy(sigma: torch.Tensor, J: torch.Tensor, h: torch.Tensor) -> float:

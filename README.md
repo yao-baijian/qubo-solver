@@ -132,44 +132,59 @@ $$
 read out at the end as σ = sign(x). Here `p` is the pump (ramped 0 → pmax), ξ
 the coupling gain, `A_s` the inverse noise scale, `dt` the Euler–Maruyama step.
 
-### Distributed computation — the math
+### Distributed computation — the math (broadcast frame)
 
-The `N` variables are split by **columns** into `nparts` modules. Module `m`
-owns the variable block `S_m` (size `n_m`), the column slice
-`J_part = J[:, S_m]` (N×n_m) and the bias slice `h_part = h[S_m]`. Splitting
-`J = J_local + J_cross`, the coupling field on module `m`'s rows is
-(paper Eqs. 12–13):
+The `N` variables are split by **columns** into `nparts` modules (a
+`nparts × nparts` **block partition** of `J`). Module `m` owns the variable
+block `S_m` (size `n_m`) and the bias slice `h_m = h[S_m]`. Splitting
+`J = J_local + J_cross` into blocks `J_{ij} = J[S_i, S_j]`, the coupling field
+on module `m`'s rows is (paper Eqs. 12–13):
 
 $$
-(Jx)_{S_m} \;=\; \underbrace{J_m\,x_m}_{\text{local (exact, every step)}}
+(Jx)_{S_m} \;=\; \underbrace{J_{mm}\,x_m}_{\text{local (exact, every step)}}
 \;+\;
 \underbrace{\sum_{m'\neq m} J_{mm'}\,x_{m'}}_{\,c_m \;=\; \text{inter-module message}},
-\qquad J_m = J[S_m,S_m],\quad J_{mm'} = J[S_m,S_{m'}].
-$$
-
-The **full local field** fed into the dynamics is therefore
-
-$$
-\text{field}_m \;=\; \underbrace{J_m x_m + c_m}_{\text{coupling}} \;+\; h_m,
 $$
 
 and the **only quantity exchanged between modules** is the message
-`c_m = Σ_{m'≠m} J_{mm'} x_{m'}` — formed by all-reducing each module's
-contribution `J[:, S_{m'}] x_{m'}` and taking the local rows. The bias `h_m` is
-**purely local** (partitioned by rows) and is never exchanged.
+`c_m = Σ_{m'≠m} J_{mm'} x_{m'}`. The bias `h_m` is **purely local** and is
+never exchanged.
+
+**Broadcast frame (this implementation).** At a synchronization step every
+node `m` computes its **off-diagonal block contributions**
+`c_{i,m} = J_{i,m} x_m` for every `i ≠ m` and broadcasts them to node `i`
+(`dist.all_to_all` in the real backend); every node `i` receives `c_{i,j}`
+from all `j ≠ i` and **combines them once into a single frozen remote field**
+`c_remote_i`. Between syncs the field is only
+
+$$
+\text{field}_m \;=\; \underbrace{J_{mm} x_m}_{\text{local block, every step}}
+\;+\; c_{remote_m} \;+\; h_m,
+$$
+
+so the per-node contributions are **never re-added step after step** — no
+over-computation. In the emulated backend the block matmuls are batched with
+`torch.bmm` (numerically identical to the per-block broadcast frame).
 
 Messages are refreshed every `time_intvl` (`K`) steps, using one of three
 schemes (paper Eqs. 14–16):
 
 | Scheme | at a sync step | between syncs |
 |---|---|---|
-| `standard` (K=1) | `field = J_m x_m + c_m + h_m` (all-reduce every step, exact) | — |
-| `const` | `field = J_m x_m + c_m + h_m` (message refreshed) | `field = J_m x_m + c_m^frozen + h_m` |
-| `pulse` | `field = J_m x_m + K·c_m^prev + h_m` (impulse) | `field = J_m x_m + h_m` |
+| `standard` (K=1) | `field = J_{mm} x_m + c_remote_m + h_m` (exact, refresh every step) | — |
+| `const` | `field = J_{mm} x_m + c_remote_m + h_m` (message refreshed) | `field = J_{mm} x_m + c_remote_m^{frozen} + h_m` |
+| `pulse` | `field = J_{mm} x_m + K·c_remote_m^{prev} + h_m` (impulse) | `field = J_{mm} x_m + h_m` |
 
 `standard` with `K=1` is exactly the centralized machine; `const` holds the
-last message between syncs; `pulse` drops the message off-sync and applies the
-previous one as a single impulse scaled by `K`.
+combined message between syncs; `pulse` drops the message off-sync and applies
+the previous one as a single impulse scaled by `K`.
+
+**Per-step coupling FLOPs** (the freeze-field acceleration): the central
+machine does `N²` MACs/step; the broadcast frame does the `N²/nparts` diagonal
+blocks every step plus the `(nparts−1)·N²/nparts` off-diagonal blocks once per
+sync, i.e. `(K·(N/nparts)² + (nparts−1)·N²/nparts)/K` MACs/step on average —
+a `~nparts·K/(K + nparts − 1)` reduction that grows with `nparts` and the sync
+period `K`.
 
 ### How to run
 
@@ -203,9 +218,66 @@ spins, energy = solve_ising(J, h, nparts=4, scheme="const", time_intvl=10,
 ```
 
 Real multi-GPU (`backend="torch"`) launches one process per module via
-`torch.distributed` (each rank loads its own `J_part`/`h_part` column slice,
-as in the reference repo's `tools/partition.py` + `torchrun` workflow). The
-emulated backend above is the same math without the process group.
+`torch.distributed` (each rank owns its column block and exchanges the
+off-diagonal contributions with `dist.all_to_all`, the real broadcast frame).
+The emulated backend above is the same math without the process group.
+
+### CuPy backend
+
+A pure-CuPy implementation of the same broadcast frame lives in
+`src/distcim/cupy_engine.py` — same block partition, same "compute
+`c_{i,m} = J_{i,m} x_m` and combine into one frozen `c_remote`" exchange, with
+all low-precision modes implemented as grid-quantized fp32 emulations
+(native fp16 kernels are not available in every CuPy build, so the numbers
+match the torch emulated paths):
+
+```python
+from src.distcim.cupy_engine import solve_ising_cupy, CupyDistCimSolver
+
+spins, energy = solve_ising_cupy(J, h, nparts=4, scheme="const", time_intvl=10,
+                                 precision="int8", num_iters=1000, seed=0)
+solver = CupyDistCimSolver(nparts=4, scheme="const", time_intvl=10,
+                           precision="fp16", num_iters=1000)
+solution = solver.solve(Q, num_vars=1000)
+```
+
+`J`/`h` may be torch tensors, cupy arrays or numpy arrays. On Windows the
+module adds `$CUDA_PATH/bin` to the DLL search path (`os.add_dll_directory`)
+so CuPy can find cuBLAS; CuPy needs a CUDA toolkit installed (a `cupy-cuda12x`
+wheel matching your toolkit). Both the precision and the runtime benchmark
+accept `--backend torch|cupy` / `--backends torch cupy` to compare them.
+
+### Multi-GPU (4× RTX 4090) — CuPy + NCCL
+
+The single-GPU paths above **batch the nodes** (one batched bmm per step +
+one dense GEMM / batched bmm per sync on the padded uniform partition) so the
+freeze-field FLOP saving is visible on one GPU. For a **multi-GPU cluster**
+the framework ships a real distributed path over **NCCL** — CuPy ≥ 12 bundles
+NCCL (`cupyx.distributed`), so **no CUDA C is required**:
+
+- `src/distcim/cupy_engine.py` — `CupyDistNCCLFieldCoupler` (real broadcast
+  frame: each rank computes `c_{i,m} = J_{i,m} x_m` and exchanges them with
+  `dist.all_to_all`, combining the received messages into one frozen
+  `c_remote`) and `CupyDistCIMNCCL` / `solve_ising_cupy_nccl` (per-rank
+  engine; all-gathers the spins and all-reduces the Ising energy).
+- `src/distcim/distributed.py` — the `TorchDistFieldCoupler` /
+  `backend="torch"` path is the same broadcast frame over
+  `torch.distributed` (use when a torch build with NCCL is installed).
+- `tools/run_distcim_multigpu.py` — launcher that spawns one process per GPU.
+
+```bash
+# single GPU smoke test (this machine)
+python tools/run_distcim_multigpu.py --nproc 1 --cars 250 --routes 3 --force-synthetic
+
+# 4x RTX 4090, single node
+python tools/run_distcim_multigpu.py --nproc 4 --cars 1250 --routes 3 --force-synthetic \
+    --steps 10000 --dt 0.01 --precision fp32 --K 10
+```
+
+Each rank owns one column block of `J` and runs its SimCIM dynamics on its
+own GPU; only the `(N/4)²` local block and the frozen `c_remote` are touched
+between syncs, so the wall-clock benefit of the freeze field (up to `flop_ratio`
+≈ 3.1× at nparts=4, K=10) finally materialises on real hardware.
 
 ### Quantization
 
@@ -235,6 +307,31 @@ Two orthogonal quantization points, both implemented:
   only the inter-module message `c_m` that crosses the network (fixed-point,
   dynamic range), modelling a low-precision communication link. It is
   orthogonal to state quantization and both can be combined.
+
+- **Arithmetic precision (hardware arithmetic)** — `precision` lowers the
+  arithmetic precision of the dominant coupling product `J @ c` (the hardware
+  the machine would run on) while the outer dynamics accumulate in float32:
+  `fp32` (default), `fp16`, `bf16`, `int8`, `int4`, `fp8` (e4m3fn), `fp4`
+  (e2m1). `fp16`/`bf16` use native tensor-core matmuls; `int8` uses the int8
+  tensor-core matmul (`torch._int_mm`) on CUDA (emulated elsewhere); `fp8`/
+  `fp4` use the exact hardware value grids with an emulated matmul. All modes
+  share a per-row scale scheme, so the dequantised field stays in float32:
+
+  ```python
+  from src import DistCimSolver, solve_ising
+
+  # QUBO-level
+  solver = DistCimSolver(nparts=4, scheme="const", time_intvl=10,
+                         precision="int8", num_iters=1000)
+  solution = solver.solve(Q, num_vars=1000)
+
+  # Ising-level
+  spins, energy = solve_ising(J, h, nparts=4, scheme="const", time_intvl=10,
+                              precision="fp16", num_iters=1000)
+  ```
+
+  `precision` is orthogonal to `x_bits`/`y_bits` (state quantization) and
+  `quantize_bits` (message quantization); all can be combined.
 
 Verification (Levels 3 & 5) shows neither quantization fundamentally changes
 the solution: message-quantized and state-quantized runs stay within a few %
@@ -304,6 +401,56 @@ python tools/benchmark_traffic_realistic.py --cars 400 --iters 200 --workers 4  
 
 Output: per-config best congestion/energy and `benchmark_results/traffic_realistic/results.md`.
 
+**Precision benchmark (dt × K sweep)** — solution quality of DistIM across
+arithmetic precisions (`fp32`/`fp16`/`int8`/`int4`/`fp8`/`fp4`) at fixed steps
+(1000/3000/5000/10000), sweeping the Euler step `dt` and the freeze-field sync
+period `K`, on GPU (or CPU with `--force-synthetic` for a quick check), for the
+`central` and `dist` (broadcast-frame freeze-field) configs and either backend.
+The `dist` sweep uses the **paper Methods** hyper-parameters: Simplified
+SimCIM, pump ramped linearly 0 → p_max (p_max = 1.1 for traffic),
+ξ = ½(ΣJ²/(n−1))⁻¹/² (`inverse_interaction_rms`), A_s = 70, A_init = 10⁻³,
+constant compensation, nparts = 4, K ∈ {1, 2, 3, 5, 7, 10}, 3 routes/car:
+
+```bash
+python tools/benchmark_distcim_precision.py --device cuda --dts 0.1 0.2 0.4 0.6 0.8 1.0 1.5 2.0 --ks 1 2 3 5 7 10   # torch (paper sweep)
+python tools/benchmark_distcim_precision.py --device cuda --backend cupy                                            # cupy
+python tools/benchmark_distcim_precision.py --device cpu --force-synthetic --cars 60 --workers 2                    # quick check
+# options: --cars --routes --seed --device --steps --precisions --dts --seeds --ks --configs central|dist --backend torch|cupy --workers
+```
+
+Output: `benchmark_results/traffic_realistic/precision_ksweep.csv` + `.md`.
+Build the markdown report (best congestion vs K per precision, summary over the
+whole dt × K × steps sweep, freeze-field FLOP analysis):
+
+```bash
+python tools/build_distcim_report.py --csv precision_ksweep.csv --baseline 11904
+```
+
+On the 750-variable traffic instance the sweep found **int4 the best precision**
+(best congestion 894 vs baseline 11904), with quality essentially preserved
+across K = 1…10 — confirming the paper's freeze-field claim.
+
+**Runtime benchmark** — per-solve wall time of `cim` (central SimCIM), `distcim`
+(freeze-field `const` K=10), `distcim-int8` and `sbm` at fixed steps
+(1000/3000/5000/10000), best-dt sweep then median of `--repeats` timed runs
+(device synchronize), on the torch and/or cupy backend:
+
+```bash
+python tools/benchmark_distcim_runtime.py --device cuda                                  # torch
+python tools/benchmark_distcim_runtime.py --device cuda --backends torch cupy           # both
+python tools/benchmark_distcim_runtime.py --device cpu --force-synthetic --cars 60 --repeats 2   # quick check
+# options: --cars --routes --seed --device --steps --seeds --methods --backends torch|cupy --repeats --no-sweep --dt
+```
+
+Output: `benchmark_results/traffic_realistic/runtime.csv` + `runtime.md`.
+
+Both scripts load the cached target-repo instance when present, else build it
+via the target repo, else fall back to a self-contained synthetic traffic
+instance (networkx) so they run anywhere. The freeze-field `distcim` config
+computes only the local `N/nparts` block between syncs — `(K·(N/nparts)² +
+N²)/K` MACs/step vs `N²` for the central machine — which is the measured
+acceleration on GPU.
+
 #### Gset MaxCut (ground state)
 
 All 71 Gset instances, best-dt sweep (0.1..1.3 step 0.1), iters 1000/3000/5000,
@@ -353,6 +500,10 @@ qubo-solver/
 │   ├── __init__.py
 │   ├── fem/           ── mean-field annealing
 │   ├── distcim/       ── DistIM distributed SimCIM (standard/const/pulse + quantization)
+│   │   ├── distributed.py  ── DistIMEngine, emulated/torch backends (broadcast frame)
+│   │   ├── engines.py      ── SimCIMEngine, CentralFieldCoupler
+│   │   ├── precision.py    ── arithmetic precision modes (fp32/fp16/bf16/int8/int4/fp8/fp4)
+│   │   └── cupy_engine.py  ── pure-CuPy broadcast-frame backend
 │   └── sbm/
 │       ├── sbm.py          ── BaseSolver, strategies, mixins, Solver
 │       ├── problems.py     ── maxcut_to_ising, bmincut_to_ising, max3sat_to_ising,
@@ -364,6 +515,9 @@ qubo-solver/
 │   ├── verify_distim.py             ── 5-level verification vs the reference repo
 │   ├── check_traffic_quant.py       ── small traffic: original vs quant vs dist (K)
 │   ├── benchmark_traffic_realistic.py ── ~5000-var realistic traffic benchmark
+│   ├── benchmark_distcim_precision.py ── precision x steps benchmark (GPU, best-dt, torch/cupy)
+│   ├── benchmark_distcim_runtime.py  ── runtime: cim vs distcim vs sbm (GPU, torch/cupy)
+│   ├── traffic_common.py            ── shared traffic instance loader + congestion
 │   ├── benchmark_gset_distcim.py    ── full Gset MaxCut benchmark
 │   ├── run_target_dist_g1.py        ── reference repo distributed check (4 ranks)
 │   ├── target_repo.py               ── in-process import of the reference repo (stubs)
@@ -388,6 +542,10 @@ qubo-solver/
 - **GSB**: typical best ``A`` is 0.2–0.4 (Goto et al. 2025).
 - **Adaptive annealing (FEM)**: per-variable β_i modulated by certainty.
 - **Unified SB**: strategy pattern + GSB/GGSB/Quantization mixins.
+- **DistCIM precision modes**: arithmetic precision for the coupling matmul
+  (`fp32`/`fp16`/`bf16`/`int8`/`int4`/`fp8`/`fp4`) + precision/runtime
+  traffic benchmarks on GPU (`tools/benchmark_distcim_precision.py`,
+  `tools/benchmark_distcim_runtime.py`).
 
 ## License
 
