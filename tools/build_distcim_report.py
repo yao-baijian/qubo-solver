@@ -49,24 +49,28 @@ def best_by(rows, key_fields):
 
 def quality_vs_k_table(rows: List[Dict], precision: str,
                        steps: List[int] = STEPS) -> List[str]:
-    """Best congestion vs K at each step count for one precision."""
+    """Best congestion vs K at each step count for one precision.
+
+    Each cell is self-consistent: `cong@S` shows the best congestion over the
+    dt x seeds sweep at step count S **together with the best dt that achieved
+    it**, so the (cong, dt) pair in a cell always belong together (the old
+    single "best dt / best seed" columns were misleading because they only
+    reflected the last step's run).
+    """
     groups = best_by(rows, ["K", "steps"])
-    header = "| K | " + " | ".join(f"cong@{s}" for s in steps) + \
-             " | best dt | best seed |"
-    sep = "|---|" + "---|" * len(steps) + "|---|---|"
+    header = "| K | " + " | ".join(
+        f"cong@{s} (best dt)" for s in steps) + " |"
+    sep = "|---|" + "---|" * len(steps)
     lines = [f"### {precision}", "", header, sep]
     for k in sorted({int(r["K"]) for r in rows if r.get("K")}):
         cells = []
-        dt_best, seed_best = "-", "-"
         for s in steps:
             r = groups.get((str(k), str(s)))
             if r is None:
                 cells.append("-")
-                continue
-            cells.append(str(r["best_congestion"]))
-            dt_best, seed_best = r["best_dt"], r["best_seed"]
-        lines.append(f"| {k} | " + " | ".join(cells) +
-                     f" | {dt_best} | {seed_best} |")
+            else:
+                cells.append(f"{r['best_congestion']} @{r['best_dt']}")
+        lines.append(f"| {k} | " + " | ".join(cells) + " |")
     lines.append("")
     return lines
 
@@ -163,8 +167,9 @@ def main():
                 continue
             lines.append(f"## {cfg} ({be}) — best congestion vs K")
             lines.append("")
-            lines.append("Rows: best congestion over the dt sweep x seeds; "
-                         "`best dt` is the dt of the best 10000-step run.")
+            lines.append("Each cell is `best congestion over (dt × seeds) @` "
+                         "**the best dt that achieved it** — the (cong, dt) "
+                         "pair in every cell belong together. Seeds {7, 11}.")
             lines.append("")
             for p in PRECISIONS:
                 p_rows = [r for r in be_rows if r["precision"] == p]

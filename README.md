@@ -279,6 +279,23 @@ own GPU; only the `(N/4)²` local block and the frozen `c_remote` are touched
 between syncs, so the wall-clock benefit of the freeze field (up to `flop_ratio`
 ≈ 3.1× at nparts=4, K=10) finally materialises on real hardware.
 
+**Multi-GPU scaling benchmark** — wall time vs the number of GPUs (1→2→…→N)
+at fixed steps / K / precision, to measure the real speedup of the broadcast
+frame on the cluster:
+
+```bash
+# 4x RTX 4090, single node (Linux, cupy-cuda12x with NCCL)
+python tools/benchmark_distcim_multigpu.py --cars 1250 --routes 3 --force-synthetic \
+    --nproc 1 2 4 --steps 1000 10000 --dt 0.01 --precision fp32 --K 10 --repeats 3
+# options: --cars --routes --seed --nproc --steps --dt --K --precision --pump
+#          --pmax --As --A_init --xi --repeats --host --port --out
+```
+
+Output: `benchmark_results/traffic_realistic/multigpu_scaling.csv` (per `nproc`
+× `steps` median wall time + speedup vs 1 GPU). Requires cupy built with NCCL
+(Linux `cupy-cuda12x` bundles it; Windows wheels do not — the script prints a
+clear error).
+
 ### Quantization
 
 Two orthogonal quantization points, both implemented:
@@ -515,8 +532,12 @@ qubo-solver/
 │   ├── verify_distim.py             ── 5-level verification vs the reference repo
 │   ├── check_traffic_quant.py       ── small traffic: original vs quant vs dist (K)
 │   ├── benchmark_traffic_realistic.py ── ~5000-var realistic traffic benchmark
-│   ├── benchmark_distcim_precision.py ── precision x steps benchmark (GPU, best-dt, torch/cupy)
+│   ├── benchmark_distcim_precision.py ── precision x dt x K sweep (GPU, best-dt, torch/cupy)
+│   ├── build_distcim_report.py      ── REPORT_distcim_gpu.md from the sweep CSV
+│   ├── benchmark_distcim_runtime_ksweep.py ── runtime K-sweep: distCIM vs cim vs sbm (GPU)
 │   ├── benchmark_distcim_runtime.py  ── runtime: cim vs distcim vs sbm (GPU, torch/cupy)
+│   ├── run_distcim_multigpu.py      ── multi-GPU distcim launcher (CuPy+NCCL, per-GPU rank)
+│   ├── benchmark_distcim_multigpu.py ── multi-GPU scaling benchmark (1..N GPUs)
 │   ├── traffic_common.py            ── shared traffic instance loader + congestion
 │   ├── benchmark_gset_distcim.py    ── full Gset MaxCut benchmark
 │   ├── run_target_dist_g1.py        ── reference repo distributed check (4 ranks)
@@ -545,7 +566,15 @@ qubo-solver/
 - **DistCIM precision modes**: arithmetic precision for the coupling matmul
   (`fp32`/`fp16`/`bf16`/`int8`/`int4`/`fp8`/`fp4`) + precision/runtime
   traffic benchmarks on GPU (`tools/benchmark_distcim_precision.py`,
-  `tools/benchmark_distcim_runtime.py`).
+  `tools/benchmark_distcim_runtime_ksweep.py`).
+- **Single-GPU acceleration**: the emulated broadcast frame batches the nodes
+  (padded uniform partition: one batched bmm/step + dense-GEMM sync,
+  `c_remote = J·x − J_diag·x`) so distCIM beats central CIM on one GPU at K≥2
+  (up to ~1.5–2.8× across precisions; `runtime.md`).
+- **Multi-GPU (4× RTX 4090)**: real distributed path over CuPy-NCCL
+  (`CupyDistNCCLFieldCoupler` / `solve_ising_cupy_nccl`) + launcher
+  (`run_distcim_multigpu.py`) + scaling benchmark
+  (`benchmark_distcim_multigpu.py`).
 
 ## License
 

@@ -139,6 +139,92 @@ def solve_sbm(J_gpu, steps, dt, seed):
     return solutions[0].cpu().numpy(), None
 
 
+def _fmt_short(step):
+    return f"{step // 1000}k" if step % 1000 == 0 else str(step)
+
+
+def _join(vals, fmt="{:.3f}"):
+    return ", ".join(fmt.format(v) for v in vals)
+
+
+def build_report_md(rows, backends, precisions, ks, steps_order, nparts,
+                    meta_lines):
+    """Timing-focused report: one row per (backend, precision, K); all step
+    counts on one line; speedup columns labelled (freeze-field boost vs CIM /
+    vs SBM, with the flop-ratio ceiling). No congestion/baseline here."""
+    lines = [
+        "# DistIM runtime benchmark (traffic) — distCIM vs central CIM vs SBM "
+        "(timing)",
+        "",
+    ]
+    lines += meta_lines
+    lines += [
+        "",
+        "> **Timing only** — solution quality (congestion / energy / baseline) "
+        "is reported separately in `REPORT_distcim_gpu.md` / "
+        "`precision_ksweep_full.csv`.",
+        "",
+        "Each row is one (backend, precision, K) with **all step counts on one "
+        "line**. `freeze-field boost vs CIM` = max over steps of "
+        "`t_CIM / t_distCIM` (same precision — the measured speedup from the "
+        "broadcast frame); `flop-ratio ceiling` is the theoretical coupling-FLOP "
+        "saving of the freeze field for nparts=4 (the upper bound the boost "
+        "approaches on real hardware).",
+        "",
+        "| backend | precision | K | steps | distCIM t (s) | central CIM t (s) "
+        "| SBM t (s) | **freeze-field boost vs CIM** | vs SBM | flop-ratio "
+        "ceiling |",
+        "|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    for be in backends:
+        for p in precisions:
+            for K in ks:
+                cell = {}
+                for r in rows:
+                    if (r["backend"] == be and r["precision"] == p
+                            and int(r["K"]) == K):
+                        cell[int(r["steps"])] = (
+                            float(r["dist_time_s"]),
+                            float(r["cim_time_s"]),
+                            float(r["sbm_time_s"]),
+                        )
+                if not cell:
+                    continue
+                sts = [s for s in steps_order if s in cell]
+                dt = [cell[s][0] for s in sts]
+                ct = [cell[s][1] for s in sts]
+                st = [cell[s][2] for s in sts]
+                boost_cim = max(c / d for d, c in zip(dt, ct))
+                boost_sbm = max(s / d for d, s in zip(dt, st))
+                fr = flop_ratio(nparts, K)
+                lines.append(
+                    f"| {be} | {p} | {K} "
+                    f"| {_join([_fmt_short(s) for s in sts], '{}')} "
+                    f"| {_join(dt)} | {_join(ct)} | {_join(st)} "
+                    f"| **{boost_cim:.2f}×** | {boost_sbm:.2f}× "
+                    f"| {fr:.2f}× |")
+    lines += [
+        "",
+        "## Notes",
+        "",
+        "- distCIM uses the **padded-batched** single-GPU broadcast frame (one "
+        "batched bmm per step + dense-GEMM / batched-bmm sync computing "
+        "`c_remote = J·x − J_diag·x`), so the freeze-field FLOP saving shows as "
+        "a real wall-clock speedup even on one GPU.",
+        "- Timing is **interleaved per (precision, K, steps) cell** so distCIM / "
+        "central CIM / SBM share the same thermal state (the RTX 4060 Laptop "
+        "throttles its SM clock ~3100→1400 MHz under sustained load).",
+        "- The boost vs CIM approaches the `flop-ratio` ceiling as N grows; on "
+        "real multi-node hardware (4×4090 / multi-FPGA) the FLOP saving is the "
+        "wall-clock speedup.",
+        "- SBM (torch BSB) is a different algorithm (software baseline); "
+        "distCIM / central CIM solve the *same* SimCIM dynamics, so their "
+        "comparison isolates the freeze-field structure.",
+        "",
+    ]
+    return lines
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -155,7 +241,39 @@ def main():
     ap.add_argument("--force-synthetic", action="store_true")
     ap.add_argument("--sweep-csv", default="precision_ksweep_full.csv")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--report-only", action="store_true",
+                    help="skip the benchmark; rebuild the report from the CSV")
+    ap.add_argument("--csv-in", default=None,
+                    help="CSV to read when --report-only")
     args = ap.parse_args()
+
+    out_dir = REPO_ROOT / "benchmark_results" / "traffic_realistic"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stem = args.out or "runtime_ksweep"
+    csv_path = out_dir / (args.csv_in or f"{stem}.csv")
+
+    if args.report_only:
+        import csv as _csv
+        with open(csv_path) as f:
+            rows = list(_csv.DictReader(f))
+        steps_order = sorted({int(r["steps"]) for r in rows})
+        backends = sorted({r["backend"] for r in rows})
+        precisions = sorted({r["precision"] for r in rows})
+        ks = sorted({int(r["K"]) for r in rows})
+        meta = [
+            f"- data: `{csv_path.name}` (all {len(rows)} (backend, precision, K, "
+            f"steps) cells); median of timed runs, interleaved per cell",
+            f"- steps: {_join(steps_order, '{}')}",
+            f"- paper params: pump linear, xi=inverse_interaction_rms, pmax=1.1, "
+            f"As=70, A_init=1e-3, nparts=4, scheme=const",
+            f"- precision column covers all of {_join(precisions, '{}')}",
+        ]
+        lines = build_report_md(rows, backends, precisions, ks, steps_order, 4,
+                                meta)
+        md_path = out_dir / f"{stem}.md"
+        md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        print(f"report-only: wrote {md_path} from {csv_path}")
+        return
 
     car_routes, J, h, source = traffic_common.load_instance(
         args.cars, args.routes, args.seed,
@@ -251,12 +369,7 @@ def main():
                           f"vs_sbm={t_s / t_dist:5.2f}x", flush=True)
         print(flush=True)
 
-    # ---- persist ----
-    out_dir = REPO_ROOT / "benchmark_results" / "traffic_realistic"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    stem = args.out or "runtime_ksweep"
-    csv_path = out_dir / f"{stem}.csv"
-
+    # ---- persist (out_dir / stem / csv_path defined at the top) ----
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["backend", "precision", "K", "steps", "best_dt",
@@ -273,90 +386,17 @@ def main():
                         f"{t_s / r['dist_time']:.3f}",
                         f"{flop_ratio(4, r['K']):.3f}"])
 
-    # ---- markdown report ----
-    lines = [
-        "# DistIM runtime K-sweep (traffic): distCIM vs central CIM vs SBM",
-        "",
+    # ---- markdown report (timing-focused, see build_report_md) ----
+    meta_lines = [
         f"- instance: {N} spin vars, dense {N}x{N} coupling (source={source})",
-        f"- device: {args.device}; backends {args.backends}; steps {args.steps}",
+        f"- device: {args.device}; backends {args.backends}; seed {args.seed}",
         f"- best dt per (precision, K) from `{args.sweep_csv}`; median of "
-        f"{args.repeats} timed runs (device sync), seed {args.seed}",
+        f"{args.repeats} timed runs, interleaved per cell (thermal-fair)",
         f"- paper params: pump linear, xi=inverse_interaction_rms, pmax=1.1, "
         f"As=70, A_init=1e-3, nparts=4, scheme=const",
-        f"- baseline (default-route) congestion: {c_default}",
-        "",
-        "> `flop_ratio` = theoretical coupling-FLOP saving of the freeze "
-        "field for nparts=4: central N² / distCIM (K·(N/4)² + 3N²/4)/K.",
-        "",
     ]
-    for be in args.backends:
-        for p in args.precisions:
-            pr = [r for r in rows if r["backend"] == be and r["precision"] == p]
-            if not pr:
-                continue
-            lines.append(f"## {p} [{be}]")
-            lines.append("")
-            lines.append("| K | steps | dist dt | distCIM time (s) | central "
-                         "CIM (s) | SBM (s) | speedup vs CIM | speedup vs "
-                         "SBM | flop ratio | dist cong | cim cong | sbm cong |")
-            lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
-            for r in sorted(pr, key=lambda x: (x["K"], x["steps"])):
-                t_s, c_s = sbm_cache.get(r["steps"], (float("nan"),
-                                                      float("nan")))
-                lines.append(
-                    f"| {r['K']} | {r['steps']} | {r['best_dt']} "
-                    f"| {r['dist_time']:.4f} | {r['cim_time']:.4f} "
-                    f"| {t_s:.4f} "
-                    f"| {r['cim_time'] / r['dist_time']:.2f}× "
-                    f"| {t_s / r['dist_time']:.2f}× "
-                    f"| {flop_ratio(4, r['K']):.2f}× "
-                    f"| {r['dist_cong']} | {r['cim_cong']} | {c_s:.0f} |")
-            lines.append("")
-
-    # summary: best (max) speedup vs cim over steps, per (backend, precision, K)
-    lines.append("## Summary — distCIM speedup vs central CIM (best over steps)")
-    lines.append("")
-    lines.append("| backend | precision | K | best speedup vs CIM | "
-                 "theoretical flop ratio |")
-    lines.append("|---|---|---|---|---|")
-    for be in args.backends:
-        for p in args.precisions:
-            for K in args.ks:
-                pr = [r for r in rows if r["backend"] == be
-                      and r["precision"] == p and r["K"] == K]
-                if not pr:
-                    continue
-                best = max(r["cim_time"] / r["dist_time"] for r in pr)
-                lines.append(f"| {be} | {p} | {K} | {best:.2f}× | "
-                             f"{flop_ratio(4, K):.2f}× |")
-    lines.append("")
-    lines.append("## Notes")
-    lines.append("")
-    lines.append("- The distCIM solver now uses the **padded-batched** "
-                 "single-GPU broadcast frame: every node's local block runs as "
-                 "one batched bmm per step, and the sync is one dense GEMM "
-                 "(fp32/fp16) or one `(n, n·B, B)` bmm (quantized) computing "
-                 "`c_remote = J·x − J_diag·x`. This is numerically identical to "
-                 "the per-block broadcast frame (verified by the test suite) "
-                 "but lets the one GPU run all nparts=4 nodes concurrently, so "
-                 "the freeze-field FLOP saving becomes a real wall-clock "
-                 "speedup even on a single GPU.")
-    lines.append("- **Fair timing under thermal throttling**: the RTX 4060 "
-                 "Laptop drops its SM clock from ~3100 to ~1400 MHz under "
-                 "sustained load, so distCIM / central CIM / SBM for each "
-                 "(precision, K, steps) cell are timed back-to-back "
-                 "(interleaved) to share the same thermal state.")
-    lines.append("- The real acceleration still grows on **multi-node "
-                 "hardware** (e.g. the future 4×4090 cluster): each node then "
-                 "computes only its local N/nparts block and exchanges the "
-                 "frozen field every K steps — same math, but no shared-GPU "
-                 "contention; `flop_ratio` (up to ~3.1× at nparts=4, K=10) is "
-                 "the ceiling.")
-    lines.append("- SBM (torch BSB) is a different algorithm (software "
-                 "baseline); distCIM / central CIM solve the *same* SimCIM "
-                 "dynamics, so their comparison isolates the freeze-field "
-                 "structure.")
-    lines.append("")
+    lines = build_report_md(rows, args.backends, args.precisions, args.ks,
+                            args.steps, 4, meta_lines)
     md_path = out_dir / f"{stem}.md"
     md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"results written to {csv_path} and {md_path}")
