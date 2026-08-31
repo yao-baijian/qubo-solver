@@ -155,6 +155,22 @@ def _quantize_state_cp(xp: cp.ndarray, precision: str, g: float) -> cp.ndarray:
 # --------------------------------------------------------------------------- #
 # quantized matmul
 # --------------------------------------------------------------------------- #
+class CupySparseMatmul:
+    """fp32 CSR matvec (cuSPARSE) — drop-in for the dense block matmul.
+
+    ``self.J`` is a ``cupyx.scipy.sparse.csr_matrix`` (B, B) block; the matvec
+    returns a dense ``(B, 1)`` field exactly like ``CupyPrecisionMatmul`` in
+    fp32 mode.
+    """
+
+    def __init__(self, J_csr):
+        self.J = J_csr
+
+    def __call__(self, c) -> cp.ndarray:
+        c = cp.asarray(c, dtype=cp.float32)
+        return self.J.dot(c)
+
+
 class CupyPrecisionMatmul:
     """Quantized ``J @ c`` in fp32 arithmetic producing an fp32 coupling field.
 
@@ -640,7 +656,8 @@ class CupyDistNCCLFieldCoupler:
                  scheme: str = "standard", time_intvl: int = 10,
                  quantize_bits: Optional[int] = None,
                  precision: Optional[str] = None,
-                 rank: int = 0, nparts: int = 1, comm=None):
+                 rank: int = 0, nparts: int = 1, comm=None,
+                 sparse: bool = False):
         self.J = J_part                       # (N, part_len) column block
         self.h_part = h_part
         self.scheme = scheme
@@ -652,8 +669,13 @@ class CupyDistNCCLFieldCoupler:
         self.comm = comm
         self.slices = _partition_columns(J_part.shape[0], nparts)
         # blocks[i] = J[S_i, S_m] (part_len x part_len) for this rank's column
-        self.blocks = [CupyPrecisionMatmul(J_part[s:e], precision)
-                       for (s, e) in self.slices]
+        if sparse:
+            # J_part is a CSR (N, part_len) column block; row-slice -> (B, B)
+            self.blocks = [CupySparseMatmul(J_part[s:e])
+                           for (s, e) in self.slices]
+        else:
+            self.blocks = [CupyPrecisionMatmul(J_part[s:e], precision)
+                           for (s, e) in self.slices]
         self.c_remote = cp.zeros_like(self.h_part)
         self._old_remote = cp.zeros_like(self.h_part)
         self._t = 0
@@ -715,23 +737,38 @@ class CupyDistCIMNCCL:
                  num_iters: int = 1000, seed: int = 0,
                  noise_scale: float = 1.0, quantize_bits: Optional[int] = None,
                  x_bits: Optional[int] = None, x_scale: float = 1.0,
-                 precision: Optional[str] = None, device: Optional[int] = None):
+                 precision: Optional[str] = None, device: Optional[int] = None,
+                 sparse: bool = False):
         self.rank = rank
         self.world_size = world_size
         self.comm = comm
+        self.sparse = sparse
         self.device = cp.cuda.Device(device if device is not None else rank)
         with self.device:
-            self.J_part = cp.asarray(J_part, dtype=cp.float32)
+            if sparse:
+                self.J_part = J_part          # keep the CSR column block
+            else:
+                self.J_part = cp.asarray(J_part, dtype=cp.float32)
             N = self.J_part.shape[0]
-            self.h_part = (cp.zeros((N, 1), dtype=cp.float32) if h_part is None
-                           else cp.asarray(h_part, dtype=cp.float32))
             self.slices = _partition_columns(N, world_size)
             s, e = self.slices[rank]
             self.start_idx, self.end_idx = s, e
+            # h is the *local* bias block (B, 1); when absent, zero it at the
+            # local block size so the broadcast-frame messages stay (B, 1)
+            # (a full-height zeros(N,1) would break c_remote + recv[j]).
+            self.h_part = (cp.zeros((e - s, 1), dtype=cp.float32)
+                           if h_part is None
+                           else cp.asarray(h_part, dtype=cp.float32))
             # coupling gain (paper)
             if isinstance(xi, str):
                 if xi == "inverse_interaction_rms":
-                    rms = cp.sqrt(cp.sum(self.J_part * self.J_part) / (N - 1))
+                    if sparse:
+                        # sum of squares from the CSR values array directly
+                        # (avoids J.multiply(J) duplicating the whole matrix)
+                        rms = cp.sqrt(
+                            (self.J_part.data * self.J_part.data).sum() / (N - 1))
+                    else:
+                        rms = cp.sqrt(cp.sum(self.J_part * self.J_part) / (N - 1))
                     xi = float(0.5 / rms)
                 else:
                     raise ValueError(f"Unknown xi mode '{xi}'")
@@ -745,7 +782,8 @@ class CupyDistCIMNCCL:
 
             self.coupler = CupyDistNCCLFieldCoupler(
                 self.J_part, self.h_part, s, e, scheme, time_intvl,
-                quantize_bits, precision, rank, world_size, comm)
+                quantize_bits, precision, rank, world_size, comm,
+                sparse=sparse)
             self.engine = CupySimCIMEngine(
                 n_local=e - s,
                 coupler=self.coupler,
@@ -778,7 +816,8 @@ class CupyDistCIMNCCL:
             # distributed energy: E = -1/2 s^T J s - h^T s
             # rank m contributes -1/2 s^T (J_part @ s_m) - h_m^T s_m
             s_all = full.reshape(-1, 1)
-            col = self.J_part @ eng.c_comp                           # (N,1)
+            col = (self.J_part.dot(eng.c_comp) if self.sparse
+                   else self.J_part @ eng.c_comp)                   # (N,1)
             partial = cp.float32(-0.5) * (s_all.T @ col) - (
                 self.h_part.T @ eng.c_comp)
             energy = cp.empty((1,), dtype=cp.float32)
@@ -794,18 +833,21 @@ def solve_ising_cupy_nccl(
     seed: int = 0, noise_scale: float = 1.0, quantize_bits: Optional[int] = None,
     x_bits: Optional[int] = None, x_scale: float = 1.0,
     precision: Optional[str] = None, device: Optional[int] = None,
+    sparse: bool = False,
 ):
     """Per-rank multi-GPU solve over cupyx.distributed NCCL.
 
     Returns ``(local_spins (L,), full_spins (N,), energy)`` — the same result
-    on every rank.  ``J_part`` is this rank's ``(N, part_len)`` column block.
+    on every rank.  ``J_part`` is this rank's ``(N, part_len)`` column block
+    (a ``cupyx.scipy.sparse.csr_matrix`` when ``sparse=True``).
     """
     engine = CupyDistCIMNCCL(
         J_part, h_part, rank, world_size, comm, scheme=scheme,
         time_intvl=time_intvl, xi=xi, A_init=A_init, As=As, dt=dt,
         pump=pump, pmax=pmax, num_iters=num_iters, seed=seed,
         noise_scale=noise_scale, quantize_bits=quantize_bits,
-        x_bits=x_bits, x_scale=x_scale, precision=precision, device=device)
+        x_bits=x_bits, x_scale=x_scale, precision=precision, device=device,
+        sparse=sparse)
     return engine.run()
 
 

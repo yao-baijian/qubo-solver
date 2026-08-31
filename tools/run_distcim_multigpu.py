@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import multiprocessing as mp
+import socket
 import sys
 import time
 from pathlib import Path
@@ -46,9 +47,137 @@ from src.distcim.cupy_engine import (  # noqa: E402
     _partition_columns, solve_ising_cupy_nccl)
 
 
+# --------------------------------------------------------------------------- #
+# Minimal NCCL rendezvous + comm shim
+# --------------------------------------------------------------------------- #
+# ``cupyx.distributed.init_process_group`` starts its rendezvous TCP store in
+# a *nested* multiprocessing.Process (using the default start method). Inside
+# a ``spawn`` worker that default is itself ``spawn``, and pickling the store's
+# bound-method target (a TCPStore holding a threading.Lock) raises
+# ``TypeError: cannot pickle '_thread.lock' object``; forcing ``fork`` there
+# deadlocks on the resource_tracker, and forking the whole worker breaks CUDA.
+# Instead we rendezvous over a plain TCP socket (128-byte nccl id, rank 0 is
+# the server) and drive the low-level ``cupy.cuda.nccl`` communicator directly
+# — no multiprocessing.Process is ever started inside a worker.
+
+
+class NcclRendezvousComm:
+    """cupyx.distributed-compatible NCCL comm with a socket rendezvous.
+
+    Implements just the ops ``cupy_engine.solve_ising_cupy_nccl`` needs
+    (``all_to_all``, ``all_gather``, ``all_reduce``) plus ``stop``.
+    """
+
+    def __init__(self, world_size: int, rank: int, host: str, port: int):
+        import cupy as cp
+        from cupy.cuda import nccl
+
+        self.world_size = world_size
+        self.rank = rank
+        self._nccl = nccl
+        self._cp = cp
+        self._nccl_dtypes = {
+            "b": nccl.NCCL_INT8, "B": nccl.NCCL_UINT8,
+            "i": nccl.NCCL_INT32, "I": nccl.NCCL_UINT32,
+            "l": nccl.NCCL_INT64, "L": nccl.NCCL_UINT64,
+            "q": nccl.NCCL_INT64, "Q": nccl.NCCL_UINT64,
+            "e": nccl.NCCL_FLOAT16, "f": nccl.NCCL_FLOAT32,
+            "d": nccl.NCCL_FLOAT64,
+            "F": nccl.NCCL_FLOAT32, "D": nccl.NCCL_FLOAT64,
+        }
+        self._nccl_ops = {"sum": nccl.NCCL_SUM, "prod": nccl.NCCL_PROD,
+                          "max": nccl.NCCL_MAX, "min": nccl.NCCL_MIN}
+
+        nccl_id = self._rendezvous(host, port)
+        self._comm = nccl.NcclCommunicator(world_size, nccl_id, rank)
+
+    # -- rendezvous --------------------------------------------------------- #
+    def _rendezvous(self, host, port) -> bytes:
+        nccl_id = self._nccl.get_unique_id()          # 128-byte bytes
+        if self.rank == 0:
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind((host, port))
+            srv.listen(self.world_size - 1)
+            try:
+                for _ in range(self.world_size - 1):
+                    conn, _ = srv.accept()
+                    with conn:
+                        conn.sendall(nccl_id)
+            finally:
+                srv.close()
+            return nccl_id
+        # every other rank connects and reads the nccl id
+        for attempt in range(200):
+            try:
+                conn = socket.create_connection((host, port), timeout=10)
+                break
+            except OSError:
+                if attempt == 199:
+                    raise
+                time.sleep(0.05)
+        with conn:
+            data = b""
+            while len(data) < len(nccl_id):
+                chunk = conn.recv(len(nccl_id) - len(data))
+                if not chunk:
+                    raise RuntimeError("rendezvous server closed early")
+                data += chunk
+        return data
+
+    # -- helpers ------------------------------------------------------------ #
+    def _dtype_count(self, array, count=None):
+        c = array.dtype.char
+        if c not in self._nccl_dtypes:
+            raise TypeError(f"Unknown dtype {array.dtype} for NCCL")
+        n = array.size if count is None else count
+        if c in "FD":
+            n *= 2
+        return self._nccl_dtypes[c], n
+
+    def _stream(self, stream):
+        if stream is None:
+            return self._cp.cuda.get_current_stream().ptr
+        return stream.ptr
+
+    # -- ops used by solve_ising_cupy_nccl ---------------------------------- #
+    def all_reduce(self, in_array, out_array, op="sum", stream=None):
+        dtype, count = self._dtype_count(in_array)
+        self._comm.allReduce(
+            in_array.data.ptr, out_array.data.ptr, count, dtype,
+            self._nccl_ops[op], self._stream(stream))
+
+    def all_gather(self, in_array, out_array, count, stream=None):
+        dtype, _ = self._dtype_count(in_array, count)
+        self._comm.allGather(
+            in_array.data.ptr, out_array.data.ptr, count, dtype,
+            self._stream(stream))
+
+    def all_to_all(self, in_array, out_array, stream=None):
+        st = self._stream(stream)
+        nccl = self._nccl
+        nccl.groupStart()
+        for i in range(self.world_size):
+            idtype, icount = self._dtype_count(in_array[i])
+            odtype, ocount = self._dtype_count(out_array[i])
+            self._comm.send(in_array[i].data.ptr, icount, idtype, i, st)
+            self._comm.recv(out_array[i].data.ptr, ocount, odtype, i, st)
+        nccl.groupEnd()
+
+    def stop(self):
+        try:
+            self._comm.destroy()
+        except Exception:
+            pass
+
+
+def _init_nccl_comm(world_size, rank, host, port):
+    """Create an NCCL communicator with a plain-socket rendezvous."""
+    return NcclRendezvousComm(world_size, rank, host, port)
+
+
 def _worker(rank, nproc, host, port, args, q):
     import cupy as cp
-    import cupyx.distributed
     if rank == 0:
         # NCCL must be compiled into cupy (Linux wheels bundle it; Windows
         # wheels do not). Fail with a clear message instead of a cryptic one.
@@ -68,8 +197,7 @@ def _worker(rank, nproc, host, port, args, q):
             q.put(dict(error=msg))
             return
     cp.cuda.Device(rank).use()
-    comm = cupyx.distributed.init_process_group(
-        nproc, rank, host=host, port=port)
+    comm = _init_nccl_comm(nproc, rank, host, port)
 
     # every rank rebuilds the same instance (deterministic), then slices its
     # column block of J — no large-matrix broadcast needed.
@@ -82,9 +210,19 @@ def _worker(rank, nproc, host, port, args, q):
                                  if hasattr(h, "detach") else np.asarray(h),
                                  dtype=np.float32)
             if h is not None else None)
+    # equal blocks for the real-NCCL broadcast frame (see _pad_uniform)
     N = J_np.shape[0]
-    s, e = _partition_columns(N, nproc)[rank]
-    J_part = cp.asarray(J_np[:, s:e])          # (N, part_len) column block
+    Npad = ((N + nproc - 1) // nproc) * nproc
+    if Npad > N:
+        J_pad = np.zeros((Npad, Npad), dtype=np.float32)
+        J_pad[:N, :N] = J_np
+        J_np = J_pad
+        if h_np is not None:
+            h_pad = np.zeros((Npad, 1), dtype=np.float32)
+            h_pad[:N] = h_np
+            h_np = h_pad
+    s, e = _partition_columns(Npad, nproc)[rank]
+    J_part = cp.asarray(J_np[:, s:e])          # (Npad, part_len) column block
     h_part = (cp.asarray(h_np[s:e]) if h_np is not None else None)
 
     kw = dict(
@@ -129,6 +267,11 @@ def main():
     ap.add_argument("--force-synthetic", action="store_true")
     args = ap.parse_args()
 
+    # ``spawn`` workers give each rank a clean interpreter + CUDA context on
+    # its assigned GPU (``fork`` breaks with CUDA already initialised in the
+    # parent). ``cupyx.distributed``'s own rendezvous TCP store is replaced by
+    # a plain-socket rendezvous (see ``_init_nccl_comm``) so no nested
+    # multiprocessing.Process is ever started inside a worker.
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
     procs = [ctx.Process(target=_worker,

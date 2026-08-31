@@ -28,3 +28,5 @@ Thumbs.db
 benchmark_results.csv
 benchmark_results/
 doc/*.tex
+
+.venv/
