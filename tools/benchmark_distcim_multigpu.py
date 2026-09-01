@@ -107,7 +107,7 @@ def _worker(rank, nproc, host, port, args, steps, K, q):
                times=[float(t) for t in times]))
 
 
-def run_nproc(args, nproc, steps, K, host, port, timeout=900):
+def run_nproc(args, nproc, steps, K, host, port, timeout=2700):
     """Run one (nproc, steps, K) config; returns median wall s or NaN on
     worker crash/OOM (instead of hanging on a 2h queue timeout)."""
     import queue as _queue
@@ -159,6 +159,9 @@ def main():
     ap.add_argument("--A_init", type=float, default=1e-3)
     ap.add_argument("--xi", default="inverse_interaction_rms")
     ap.add_argument("--repeats", type=int, default=3)
+    ap.add_argument("--timeout", type=float, default=2700,
+                    help="per-config worker timeout in seconds (heavy "
+                         "single-GPU 100k baselines need > 900s)")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=29500)
     ap.add_argument("--force-synthetic", action="store_true")
@@ -203,7 +206,8 @@ def main():
                     print(f"  nproc={nproc} steps={steps:>6} K={K:>3}  "
                           f"(already in CSV, skipping)")
                     continue
-                t = run_nproc(args, nproc, steps, K, args.host, args.port)
+                t = run_nproc(args, nproc, steps, K, args.host, args.port,
+                              timeout=args.timeout)
                 if isinstance(t, list):                 # per-repeat times
                     times = t
                     t = float(np.median(times))          # final average (median)

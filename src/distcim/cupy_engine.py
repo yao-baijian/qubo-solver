@@ -747,6 +747,12 @@ class CupyDistCIMNCCL:
         with self.device:
             if sparse:
                 self.J_part = J_part          # keep the CSR column block
+            elif isinstance(J_part, cp.ndarray) and J_part.dtype == cp.float32:
+                # already a float32 GPU array from the caller; reuse it so the
+                # full (N,N) column block isn't copied twice (nproc=1 dense at
+                # N=100k needs ~40 GB; a second asarray would need ~80 GB and
+                # OOM even on a 47 GB card).
+                self.J_part = J_part
             else:
                 self.J_part = cp.asarray(J_part, dtype=cp.float32)
             N = self.J_part.shape[0]
@@ -768,7 +774,17 @@ class CupyDistCIMNCCL:
                         rms = cp.sqrt(
                             (self.J_part.data * self.J_part.data).sum() / (N - 1))
                     else:
-                        rms = cp.sqrt(cp.sum(self.J_part * self.J_part) / (N - 1))
+                        # sum of squares without materialising the full (N,N)
+                        # square; for nproc=1 dense at N=100k (40 GB block)
+                        # J_part*J_part would need another 40 GB and OOM even
+                        # on a 47 GB card.  Chunk over rows to bound the
+                        # temporary, accumulating a scalar.
+                        nn = self.J_part.shape[0]
+                        ssum = 0.0
+                        for r0 in range(0, nn, 4096):
+                            chunk = self.J_part[r0:min(r0 + 4096, nn)]
+                            ssum += float(cp.sum(chunk * chunk))
+                        rms = cp.sqrt(cp.float32(ssum) / (N - 1))
                     xi = float(0.5 / rms)
                 else:
                     raise ValueError(f"Unknown xi mode '{xi}'")
